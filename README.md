@@ -5,20 +5,20 @@ BioNOVA 将 bioinfo-server-init.sh 内嵌为单个 Linux 可执行程序 bionova
 ## 直接运行
 
 ~~~bash
-./dist/bionova --dry-run
-./dist/bionova
+./bionova --dry-run
+./bionova
 ~~~
 
 版本信息：
 
 ~~~bash
-./dist/bionova --version
+./bionova --version
 ~~~
 
 查看内嵌脚本 SHA256：
 
 ~~~bash
-./dist/bionova --script-sha256
+./bionova --script-sha256
 ~~~
 
 当前构建目标：
@@ -101,6 +101,8 @@ bash
 输出：
 
 ~~~text
+bionova
+bionova.sha256
 dist/bionova
 dist/bionova.sha256
 ~~~
@@ -160,8 +162,8 @@ bash -n ../bioinfo-server-init.sh
 ./build.sh
 
 # 4. 验证
-./dist/bionova --version
-./dist/bionova --dry-run
+./bionova --version
+./bionova --dry-run
 ~~~
 
 ## License
