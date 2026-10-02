@@ -96,4 +96,9 @@ sha256sum "$OUT" | tee "$OUT.sha256"
 file "$OUT"
 "$OUT" --version
 
+cp "$OUT" "$ROOT/bionova"
+chmod 0755 "$ROOT/bionova"
+sha256sum "$ROOT/bionova" > "$ROOT/bionova.sha256"
+
 echo "Built: $OUT"
+echo "Direct executable: $ROOT/bionova"
