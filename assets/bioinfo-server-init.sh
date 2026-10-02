@@ -1277,6 +1277,7 @@ channels:
     fi
 
     "${mm_prefix[@]}" env CONDARC="$condarc" "$manager" config set show_channel_urls true
+    "${mm_prefix[@]}" env CONDARC="$condarc" "$manager" config set use_sharded_repodata false
     for channel in "${channels[@]}"; do
       if ! "${mm_prefix[@]}" env CONDARC="$condarc" "$manager" config list 2>/dev/null | grep -Fq -- "$channel"; then
         "${mm_prefix[@]}" env CONDARC="$condarc" "$manager" config append channels "$channel"
@@ -1538,6 +1539,7 @@ install_micromamba_for_account() {
 
   append_named_user_line_once "$user" "$home/.bashrc" 'export PATH="$HOME/data_HD/bin:$PATH"'
   as_named_user "$user" env MAMBA_ROOT_PREFIX="$root_prefix" "$binary" shell init -s bash -r "$root_prefix"
+  as_named_user "$user" env MAMBA_ROOT_PREFIX="$root_prefix" "$binary" config set use_sharded_repodata false
   as_named_user "$user" mkdir -p "$home/.config/bioinfo-setup"
   write_named_user_file "$user" "$home/.config/bioinfo-setup/micromamba.bin" "$binary"
 
@@ -1952,7 +1954,7 @@ install_metacat_for_user() {
       return 1
     }
     local installed_version
-    installed_version="$(as_named_user "$user" env MAMBA_ROOT_PREFIX="$root_prefix" "$mm" run -n MetaCAT python -m pip show metacat 2>/dev/null | awk '/^Version:/ {print $2; exit}')"
+    installed_version="$(as_named_user "$user" env MAMBA_ROOT_PREFIX="$root_prefix" "$mm" run -n MetaCAT python -m pip show metacat 2>/dev/null | awk '/^Version:/ {value=$2} END {print value}')"
     [[ "$installed_version" == "$METACAT_LATEST_VERSION" ]] || {
       warn "MetaCAT 版本校验失败：期望=$METACAT_LATEST_VERSION 实际=${installed_version:-unknown}"
       return 1
@@ -1981,7 +1983,7 @@ create_metacat_for_login_user() {
       python -m pip install --upgrade "$METACAT_LATEST_WHEEL"
     if (( DRY_RUN == 0 )); then
       as_login_user env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" run -n MetaCAT MetaCAT --help >/dev/null 2>&1 || return 1
-      installed_version="$(as_login_user env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" run -n MetaCAT python -m pip show metacat 2>/dev/null | awk '/^Version:/ {print $2; exit}')"
+      installed_version="$(as_login_user env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" run -n MetaCAT python -m pip show metacat 2>/dev/null | awk '/^Version:/ {value=$2} END {print value}')"
     fi
   else
     [[ -d "$base_prefix/envs/MetaCAT" || -d "$home/.conda/envs/MetaCAT" ]] && env_exists=1
@@ -1994,7 +1996,7 @@ create_metacat_for_login_user() {
     as_login_user "$manager_bin" run -n MetaCAT python -m pip install --upgrade "$METACAT_LATEST_WHEEL"
     if (( DRY_RUN == 0 )); then
       as_login_user "$manager_bin" run -n MetaCAT MetaCAT --help >/dev/null 2>&1 || return 1
-      installed_version="$(as_login_user "$manager_bin" run -n MetaCAT python -m pip show metacat 2>/dev/null | awk '/^Version:/ {print $2; exit}')"
+      installed_version="$(as_login_user "$manager_bin" run -n MetaCAT python -m pip show metacat 2>/dev/null | awk '/^Version:/ {value=$2} END {print value}')"
     fi
   fi
 
@@ -2128,6 +2130,7 @@ create_bioinfo_envs() {
 
   if [[ "$manager_type" == "micromamba" ]]; then
     as_login_user mkdir -p "$root_prefix"
+    as_login_user env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" config set use_sharded_repodata false
   else
     base_prefix="$(dirname "$(dirname "$manager_bin")")"
   fi
