@@ -21,7 +21,7 @@ SCRIPT="$ROOT/assets/bioinfo-server-init.sh"
 ALLOW_DYNAMIC="${ALLOW_DYNAMIC:-0}"
 
 if [[ "${1:-}" == "--sync" ]]; then
-  "$ROOT/scripts/sync-script.sh"
+  bash "$ROOT/scripts/sync-script.sh"
 fi
 
 [[ -f "$SCRIPT" ]] || {
@@ -114,7 +114,7 @@ elif command -v docker >/dev/null 2>&1; then
     bash -c 'set -e
       apt-get update -qq
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential python3 file >/dev/null
-      ./build.sh
+      bash ./build.sh
       chown -R "$HOST_UID:$HOST_GID" dist .build'
 else
   echo "Build requires gcc+python3 or Docker." >&2
