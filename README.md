@@ -66,6 +66,8 @@ metacat-*-py3-none-any.whl
 
 然后在 Python 3.12 的独立 MetaCAT 环境中执行 pip upgrade。
 
+为兼容清华 Conda 镜像，micromamba 会设置 `use_sharded_repodata: false`，避免 shard index 缺失时的 fallback 告警。MetaCAT 版本校验也避免使用会提前关闭上游管道的 `awk ... exit` 写法，从而规避 rc=120。
+
 ## 同步 Bash 源码
 
 BioNOVA/assets/bioinfo-server-init.sh 是编译进二进制的快照。
