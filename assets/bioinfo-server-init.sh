@@ -29,6 +29,10 @@ TUNA_R_CHANNEL="https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r"
 TUNA_CONDA_FORGE_CHANNEL="https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge"
 TUNA_BIOCONDA_CHANNEL="https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/bioconda"
 METACAT_RELEASE_API="https://api.github.com/repos/liu-congcong/MetaCAT/releases/latest"
+CHECKM2_DB_URL="https://zenodo.org/api/records/14897628/files/checkm2_database.tar.gz/content"
+CHECKM2_DB_MD5="07c10655620843b517d0df0c160d911f"
+GTDBTK_R232_URL="https://data.gtdb.ecogenomic.org/releases/release232/232.0/auxillary_files/gtdbtk_package/full_package/gtdbtk_r232_data.tar.gz"
+GTDBTK_R232_MD5="25a59e0352b1fd150c589f56559767d4"
 METACAT_LATEST_TAG=""
 METACAT_LATEST_VERSION=""
 METACAT_LATEST_WHEEL=""
@@ -1571,17 +1575,15 @@ install_micromamba_account_menu() {
   install_micromamba_for_account "$user"
 }
 
-install_metawrap_for_user() {
-  local user="${1:-}" home conda_bin env_name="metaWRAP"
+install_metawrap_for_account() {
+  local user="$1" home conda_bin env_name="metaWRAP"
 
-  if [[ -z "$user" ]]; then
-    read -r -p "安装 metaWRAP 的普通用户名: " user
-  fi
   validate_simple_name "$user" || { warn "用户名格式不合法。"; return 1; }
-  [[ "$user" != "root" ]] || { warn "普通用户 metaWRAP 入口不接受 root。"; return 1; }
   id "$user" >/dev/null 2>&1 || { warn "用户 $user 不存在。"; return 1; }
 
-  home="$(getent passwd "$user" | cut -d: -f6)"
+  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 1; }
+
   conda_bin="$(find_named_user_miniconda "$user" 2>/dev/null || true)"
   if [[ -z "$conda_bin" ]]; then
     warn "用户 $user 尚未满足 micromamba 前置条件；先安装 micromamba（会自动安装 Miniconda 前置）。"
@@ -1599,7 +1601,7 @@ install_metawrap_for_user() {
     return 0
   fi
 
-  info "为普通用户 $user 创建 metaWRAP 1.3.2 独立环境。"
+  info "为账号 $user 创建 metaWRAP 1.3.2 独立环境。"
   info "按 metaWRAP 上游建议使用 ursky channel；数据库配置不在本步骤自动下载。"
   as_named_user "$user" "$conda_bin" create -y -n "$env_name" --override-channels \
     -c "$URSKY_CHANNEL" \
@@ -1623,6 +1625,14 @@ install_metawrap_for_user() {
 
   log "metaWRAP 安装完成: user=$user env=$env_name"
   info "用户登录后可执行: conda activate $env_name"
+}
+
+install_metawrap_for_user() {
+  local user=""
+  read -r -p "安装 metaWRAP 的普通用户名: " user
+  validate_simple_name "$user" || { warn "用户名格式不合法。"; return 1; }
+  [[ "$user" != "root" ]] || { warn "普通用户入口不能填写 root。"; return 1; }
+  install_metawrap_for_account "$user"
 }
 
 create_metawrap_for_login_user() {
@@ -1695,9 +1705,104 @@ metawrap_config_set_for_user() {
   info "config-metawrap: $key=$value"
 }
 
+copy_root_database_tree() {
+  local user="$1" source="$2" dest="$3" label="$4"
+  local home group
+
+  [[ "$user" != "root" ]] || return 1
+  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 1; }
+  [[ "$source" == /root/data_HD/* ]] || { warn "拒绝复制非 root 数据库缓存路径: $source"; return 1; }
+  [[ "$dest" == "$home/"* ]] || { warn "目标数据库路径必须位于 $home 下: $dest"; return 1; }
+  [[ -d "$source" ]] || return 1
+
+  if ! confirm "检测到 root 本地 $label，优先复制到用户 $user？" "Y"; then
+    return 1
+  fi
+
+  command -v rsync >/dev/null 2>&1 || {
+    as_root apt-get update
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y rsync
+  }
+
+  group="$(id -gn "$user" 2>/dev/null || printf '%s' "$user")"
+  as_root mkdir -p "$dest"
+  as_root rsync -a --info=progress2 "$source/" "$dest/"
+  as_root chown -R "$user:$group" "$dest"
+  log "已从 root 本地缓存复制 $label: $source -> $dest"
+}
+
+metawrap_db_ready() {
+  local db_root="$1" kind="$2"
+  case "$kind" in
+    checkm)
+      [[ -e "$db_root/CheckM/.bioinfo-download-complete" ]]
+      ;;
+    kraken2)
+      [[ -e "$db_root/KRAKEN2/hash.k2d" && -e "$db_root/KRAKEN2/opts.k2d" && -e "$db_root/KRAKEN2/taxo.k2d" ]]
+      ;;
+    nt)
+      find "$db_root/NCBI_nt" -maxdepth 1 -type f -name 'nt.*' -print -quit 2>/dev/null | grep -q .
+      ;;
+    taxonomy)
+      [[ -e "$db_root/NCBI_tax/nodes.dmp" && -e "$db_root/NCBI_tax/names.dmp" ]]
+      ;;
+    bmtagger)
+      [[ -e "$db_root/BMTAGGER_INDEX/hg38.fa" && -e "$db_root/BMTAGGER_INDEX/hg38.bitmask" ]] &&
+        find "$db_root/BMTAGGER_INDEX" -maxdepth 1 -name 'hg38.srprism*' -print -quit 2>/dev/null | grep -q .
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+maybe_copy_metawrap_db_from_root() {
+  local user="$1" db_root="$2" kind="$3"
+  local root_db="/root/data_HD/metawrap_db"
+  local subdir label
+
+  [[ "$user" != "root" ]] || return 1
+  case "$kind" in
+    checkm) subdir="CheckM"; label="metaWRAP CheckM 数据库" ;;
+    kraken2) subdir="KRAKEN2"; label="metaWRAP Kraken2 数据库" ;;
+    nt) subdir="NCBI_nt"; label="metaWRAP NCBI nt 数据库" ;;
+    taxonomy) subdir="NCBI_tax"; label="metaWRAP NCBI taxonomy 数据库" ;;
+    bmtagger) subdir="BMTAGGER_INDEX"; label="metaWRAP BMTAGGER hg38 索引" ;;
+    *) return 1 ;;
+  esac
+
+  metawrap_db_ready "$root_db" "$kind" || return 1
+  copy_root_database_tree "$user" "$root_db/$subdir" "$db_root/$subdir" "$label"
+}
+
+show_metawrap_db_status() {
+  local db_root="$1" kind label
+  printf '\nmetaWRAP 数据库状态: %s\n' "$db_root"
+  for kind in checkm kraken2 nt taxonomy bmtagger; do
+    case "$kind" in
+      checkm) label="CheckM" ;;
+      kraken2) label="Kraken2" ;;
+      nt) label="NCBI nt" ;;
+      taxonomy) label="NCBI taxonomy" ;;
+      bmtagger) label="BMTAGGER hg38" ;;
+    esac
+    if metawrap_db_ready "$db_root" "$kind"; then
+      printf '  %-18s READY\n' "$label"
+    else
+      printf '  %-18s MISSING\n' "$label"
+    fi
+  done
+}
+
 download_metawrap_checkm_db() {
   local user="$1" conda_bin="$2" db_root="$3"
   local dir="$db_root/CheckM" archive="$db_root/CheckM/checkm_data_2015_01_16.tar.gz"
+  if maybe_copy_metawrap_db_from_root "$user" "$db_root" checkm; then
+    as_named_user "$user" "$conda_bin" run -n metaWRAP checkm data setRoot "$dir"
+    log "CheckM 数据库已从 root 本地缓存复制并配置: $dir"
+    return 0
+  fi
   as_named_user "$user" mkdir -p "$dir"
   if [[ -e "$dir/.bioinfo-download-complete" ]]; then
     info "CheckM 数据库已存在，跳过下载: $dir"
@@ -1714,6 +1819,11 @@ download_metawrap_checkm_db() {
 download_metawrap_kraken2_db() {
   local user="$1" conda_bin="$2" db_root="$3" threads="$4"
   local dir="$db_root/KRAKEN2"
+  if maybe_copy_metawrap_db_from_root "$user" "$db_root" kraken2; then
+    metawrap_config_set_for_user "$user" "$conda_bin" KRAKEN2_DB "$dir"
+    log "Kraken2 数据库已从 root 本地缓存复制并配置: $dir"
+    return 0
+  fi
   warn "Kraken2 standard 数据库需要大量磁盘和内存；官方 metaWRAP 文档给出的量级约 125GB，构建阶段资源需求较高。"
   confirm "确认下载并构建 Kraken2 standard 数据库？" || return 0
   as_named_user "$user" mkdir -p "$dir"
@@ -1729,6 +1839,11 @@ download_metawrap_kraken2_db() {
 download_metawrap_ncbi_nt_db() {
   local user="$1" conda_bin="$2" db_root="$3"
   local dir="$db_root/NCBI_nt"
+  if maybe_copy_metawrap_db_from_root "$user" "$db_root" nt; then
+    metawrap_config_set_for_user "$user" "$conda_bin" BLASTDB "$dir"
+    log "NCBI nt 数据库已从 root 本地缓存复制并配置: $dir"
+    return 0
+  fi
   warn "NCBI nt 是超大型、多卷且持续更新的数据库；请确保目标目录有充足可用空间。"
   confirm "确认下载/更新 NCBI nt BLAST 数据库？" || return 0
   as_named_user "$user" mkdir -p "$dir"
@@ -1754,6 +1869,11 @@ download_metawrap_ncbi_nt_db() {
 download_metawrap_ncbi_tax_db() {
   local user="$1" conda_bin="$2" db_root="$3"
   local dir="$db_root/NCBI_tax" archive="$db_root/NCBI_tax/taxdump.tar.gz"
+  if maybe_copy_metawrap_db_from_root "$user" "$db_root" taxonomy; then
+    metawrap_config_set_for_user "$user" "$conda_bin" TAXDUMP "$dir"
+    log "NCBI taxonomy 已从 root 本地缓存复制并配置: $dir"
+    return 0
+  fi
   as_named_user "$user" mkdir -p "$dir"
   as_named_user "$user" curl -fL --retry 3 --retry-delay 5 "https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz" -o "$archive"
   as_named_user "$user" tar -xzf "$archive" -C "$dir"
@@ -1765,6 +1885,11 @@ download_metawrap_ncbi_tax_db() {
 download_metawrap_bmtagger_db() {
   local user="$1" conda_bin="$2" db_root="$3"
   local dir="$db_root/BMTAGGER_INDEX"
+  if maybe_copy_metawrap_db_from_root "$user" "$db_root" bmtagger; then
+    metawrap_config_set_for_user "$user" "$conda_bin" BMTAGGER_DB "$dir"
+    log "BMTAGGER hg38 索引已从 root 本地缓存复制并配置: $dir"
+    return 0
+  fi
   warn "hg38 BMTAGGER 索引下载与构建需要较大磁盘/内存；官方 metaWRAP 文档给出的索引量级约 20GB。"
   confirm "确认下载 hg38 并构建 BMTAGGER 索引？" || return 0
   as_named_user "$user" mkdir -p "$dir"
@@ -1782,15 +1907,32 @@ download_metawrap_bmtagger_db() {
   log "BMTAGGER hg38 索引配置完成: $dir"
 }
 
-download_metawrap_databases_for_user() {
-  local user="" home conda_bin db_root choice threads free_space
+manage_metawrap_databases() {
+  local target user="" home conda_bin db_root choice threads free_space
 
-  read -r -p "下载 metaWRAP 数据库的用户名: " user
+  printf '\nmetaWRAP 数据库目标账号：\n'
+  printf '1) root（作为本机数据库缓存源）\n'
+  printf '2) 指定普通用户\n'
+  printf '0) 返回\n'
+  read -r -p "选择 [1]: " target
+  target="${target:-1}"
+
+  case "$target" in
+    1) user="root" ;;
+    2)
+      read -r -p "普通用户名: " user
+      [[ "$user" != "root" ]] || { warn "普通用户入口不能填写 root。"; return 1; }
+      ;;
+    0) return 0 ;;
+    *) warn "无效选择。"; return 1 ;;
+  esac
+
   validate_simple_name "$user" || { warn "用户名格式不合法。"; return 1; }
-  [[ "$user" != "root" ]] || { warn "该入口用于普通用户数据库目录，请选择非 root 用户。"; return 1; }
   id "$user" >/dev/null 2>&1 || { warn "用户 $user 不存在。"; return 1; }
 
-  home="$(getent passwd "$user" | cut -d: -f6)"
+  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 1; }
+
   conda_bin="$(find_named_user_miniconda "$user" 2>/dev/null || true)"
   if [[ -z "$conda_bin" ]]; then
     warn "用户 $user 没有 Miniconda；先安装 micromamba（自动安装 Miniconda 前置）。"
@@ -1804,9 +1946,9 @@ download_metawrap_databases_for_user() {
   [[ -n "$conda_bin" ]] || { warn "无法找到 $user 的 Miniconda。"; return 1; }
 
   if (( DRY_RUN == 0 )) && ! as_named_user "$user" "$conda_bin" env list 2>/dev/null | awk '{print $1}' | grep -Fxq metaWRAP; then
-    warn "用户 $user 尚未创建 metaWRAP 环境。"
+    warn "账号 $user 尚未创建 metaWRAP 环境。"
     if confirm "现在先为 $user 安装 metaWRAP？" "Y"; then
-      install_metawrap_for_user "$user" || return 1
+      install_metawrap_for_account "$user" || return 1
     else
       return 0
     fi
@@ -1838,6 +1980,7 @@ download_metawrap_databases_for_user() {
   printf '4) NCBI taxonomy\n'
   printf '5) hg38 BMTAGGER index\n'
   printf '6) 全部\n'
+  printf '7) 检查数据库状态\n'
   printf '0) 返回\n'
   read -r -p "选择: " choice
 
@@ -1859,6 +2002,7 @@ download_metawrap_databases_for_user() {
       download_metawrap_ncbi_tax_db "$user" "$conda_bin" "$db_root"
       download_metawrap_bmtagger_db "$user" "$conda_bin" "$db_root"
       ;;
+    7) show_metawrap_db_status "$db_root" ;;
     0) return 0 ;;
     *) warn "无效选择。"; return 1 ;;
   esac
@@ -1916,6 +2060,264 @@ PY
 
   info "MetaCAT 官方最新 Release: tag=$METACAT_LATEST_TAG version=$METACAT_LATEST_VERSION"
   info "MetaCAT wheel: $METACAT_LATEST_WHEEL"
+}
+
+set_named_user_export() {
+  local user="$1" key="$2" value="$3"
+  local home file line
+
+  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 1; }
+  file="$home/.bashrc"
+  line="export $key=\"$value\""
+
+  if grep -Eq "^export[[:space:]]+$key=" "$file" 2>/dev/null; then
+    as_named_user "$user" sed -i -E "s|^export[[:space:]]+$key=.*|$line|" "$file"
+  else
+    append_named_user_line_once "$user" "$file" "$line"
+  fi
+  info "已写入 $user 环境变量: $key=$value"
+}
+
+metacat_checkm2_db_path() {
+  local db_root="$1"
+  local direct="$db_root/checkm2/uniref100.KO.1.dmnd" found=""
+  if [[ -f "$direct" ]]; then
+    printf '%s' "$direct"
+    return 0
+  fi
+  found="$(find "$db_root/checkm2" -type f -name 'uniref100.KO.1.dmnd' -print 2>/dev/null | awk 'NR==1 {value=$0} END {print value}')"
+  [[ -n "$found" ]] || return 1
+  printf '%s' "$found"
+}
+
+metacat_gtdb_r232_path() {
+  local db_root="$1"
+  local direct="$db_root/gtdbtk/r232" found=""
+  if [[ -d "$direct" ]]; then
+    printf '%s' "$direct"
+    return 0
+  fi
+  if [[ -d "$db_root/gtdbtk/release232" ]]; then
+    printf '%s' "$db_root/gtdbtk/release232"
+    return 0
+  fi
+  found="$(find "$db_root/gtdbtk" -maxdepth 2 -type d -name 'release232' -print 2>/dev/null | awk 'NR==1 {value=$0} END {print value}')"
+  [[ -n "$found" ]] || return 1
+  printf '%s' "$found"
+}
+
+metacat_db_ready() {
+  local db_root="$1" kind="$2"
+  case "$kind" in
+    checkm2) metacat_checkm2_db_path "$db_root" >/dev/null 2>&1 ;;
+    gtdbtk) metacat_gtdb_r232_path "$db_root" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+maybe_copy_metacat_db_from_root() {
+  local user="$1" db_root="$2" kind="$3"
+  local root_db="/root/data_HD/metacat_db"
+  local subdir label
+
+  [[ "$user" != "root" ]] || return 1
+  case "$kind" in
+    checkm2) subdir="checkm2"; label="MetaCAT CheckM2 数据库" ;;
+    gtdbtk) subdir="gtdbtk"; label="MetaCAT GTDB-Tk R232 数据库" ;;
+    *) return 1 ;;
+  esac
+
+  metacat_db_ready "$root_db" "$kind" || return 1
+  copy_root_database_tree "$user" "$root_db/$subdir" "$db_root/$subdir" "$label"
+}
+
+configure_metacat_db_env() {
+  local user="$1" db_root="$2"
+  local checkm2_path="" gtdb_path=""
+
+  checkm2_path="$(metacat_checkm2_db_path "$db_root" 2>/dev/null || true)"
+  gtdb_path="$(metacat_gtdb_r232_path "$db_root" 2>/dev/null || true)"
+
+  if [[ -n "$checkm2_path" ]]; then
+    set_named_user_export "$user" CHECKM2DB "$checkm2_path"
+  fi
+  if [[ -n "$gtdb_path" ]]; then
+    set_named_user_export "$user" GTDBTK_DATA_PATH "$gtdb_path"
+  fi
+}
+
+download_metacat_checkm2_db() {
+  local user="$1" db_root="$2"
+  local dir="$db_root/checkm2" archive="$db_root/checkm2/checkm2_database.tar.gz"
+  local found=""
+
+  if maybe_copy_metacat_db_from_root "$user" "$db_root" checkm2; then
+    if (( DRY_RUN )); then
+      set_named_user_export "$user" CHECKM2DB "$db_root/checkm2/uniref100.KO.1.dmnd"
+    else
+      configure_metacat_db_env "$user" "$db_root"
+    fi
+    log "CheckM2 数据库已从 root 本地缓存复制并配置。"
+    return 0
+  fi
+
+  if metacat_db_ready "$db_root" checkm2; then
+    info "CheckM2 数据库已存在，跳过下载。"
+    configure_metacat_db_env "$user" "$db_root"
+    return 0
+  fi
+
+  info "下载 CheckM2 v1.1.0 参考数据库（Zenodo 14897628）。"
+  as_named_user "$user" mkdir -p "$dir"
+  as_named_user "$user" curl -fL --retry 3 --retry-delay 5 -C - "$CHECKM2_DB_URL" -o "$archive"
+  as_named_user_in_dir "$user" "$dir" bash -c 'printf "%s  %s\n" "$1" "$2" | md5sum -c -' _ "$CHECKM2_DB_MD5" "$(basename "$archive")"
+  as_named_user "$user" tar -xzf "$archive" -C "$dir"
+
+  if (( DRY_RUN )); then
+    as_named_user "$user" rm -f "$archive"
+    set_named_user_export "$user" CHECKM2DB "$dir/uniref100.KO.1.dmnd"
+    log "dry-run：假定 CheckM2 数据库解压完成: $dir/uniref100.KO.1.dmnd"
+    return 0
+  fi
+
+  found="$(find "$dir" -type f -name 'uniref100.KO.1.dmnd' -print 2>/dev/null | awk 'NR==1 {value=$0} END {print value}')"
+  [[ -n "$found" ]] || { warn "CheckM2 数据库解压后未找到 uniref100.KO.1.dmnd"; return 1; }
+  if [[ "$found" != "$dir/uniref100.KO.1.dmnd" ]]; then
+    as_named_user "$user" mv "$found" "$dir/uniref100.KO.1.dmnd"
+  fi
+  as_named_user "$user" rm -f "$archive"
+  configure_metacat_db_env "$user" "$db_root"
+  log "CheckM2 数据库下载完成: $dir/uniref100.KO.1.dmnd"
+}
+
+download_metacat_gtdb_r232_db() {
+  local user="$1" db_root="$2"
+  local dir="$db_root/gtdbtk" archive="$db_root/gtdbtk/gtdbtk_r232_data.tar.gz"
+  local release_dir=""
+
+  if maybe_copy_metacat_db_from_root "$user" "$db_root" gtdbtk; then
+    if (( DRY_RUN )); then
+      set_named_user_export "$user" GTDBTK_DATA_PATH "$db_root/gtdbtk/r232"
+    else
+      configure_metacat_db_env "$user" "$db_root"
+    fi
+    log "GTDB-Tk R232 数据库已从 root 本地缓存复制并配置。"
+    return 0
+  fi
+
+  if metacat_db_ready "$db_root" gtdbtk; then
+    info "GTDB-Tk R232 数据库已存在，跳过下载。"
+    configure_metacat_db_env "$user" "$db_root"
+    return 0
+  fi
+
+  warn "GTDB-Tk R232 压缩包约 56.6 GB，解压后约需 100 GB；请确保磁盘空间充足。"
+  confirm "确认下载 GTDB-Tk R232？" || return 0
+
+  as_named_user "$user" mkdir -p "$dir"
+  as_named_user "$user" curl -fL --retry 5 --retry-delay 10 -C - "$GTDBTK_R232_URL" -o "$archive"
+  as_named_user_in_dir "$user" "$dir" bash -c 'printf "%s  %s\n" "$1" "$2" | md5sum -c -' _ "$GTDBTK_R232_MD5" "$(basename "$archive")"
+  as_named_user "$user" tar -xzf "$archive" -C "$dir"
+  as_named_user "$user" rm -f "$archive"
+
+  if (( DRY_RUN )); then
+    as_named_user "$user" ln -sfn "release232" "$dir/r232"
+    set_named_user_export "$user" GTDBTK_DATA_PATH "$dir/r232"
+    log "dry-run：假定 GTDB-Tk R232 解压完成: $dir/r232"
+    return 0
+  fi
+
+  release_dir="$(find "$dir" -maxdepth 2 -type d -name 'release232' -print 2>/dev/null | awk 'NR==1 {value=$0} END {print value}')"
+  [[ -n "$release_dir" ]] || { warn "GTDB-Tk R232 解压后未找到 release232 目录。"; return 1; }
+
+  if [[ "$release_dir" != "$dir/release232" ]]; then
+    as_named_user "$user" mv "$release_dir" "$dir/release232"
+  fi
+  as_named_user "$user" ln -sfn "release232" "$dir/r232"
+  configure_metacat_db_env "$user" "$db_root"
+  log "GTDB-Tk R232 数据库下载完成: $dir/r232"
+}
+
+show_metacat_db_status() {
+  local db_root="$1"
+  local checkm2_path="" gtdb_path=""
+
+  checkm2_path="$(metacat_checkm2_db_path "$db_root" 2>/dev/null || true)"
+  gtdb_path="$(metacat_gtdb_r232_path "$db_root" 2>/dev/null || true)"
+
+  printf '\nMetaCAT 数据库状态: %s\n' "$db_root"
+  if [[ -n "$checkm2_path" ]]; then
+    printf '  %-18s READY  %s\n' "CheckM2" "$checkm2_path"
+  else
+    printf '  %-18s MISSING\n' "CheckM2"
+  fi
+  if [[ -n "$gtdb_path" ]]; then
+    printf '  %-18s READY  %s\n' "GTDB-Tk R232" "$gtdb_path"
+  else
+    printf '  %-18s MISSING\n' "GTDB-Tk R232"
+  fi
+}
+
+manage_metacat_databases() {
+  local target user="" home db_root choice free_space
+
+  printf '\nMetaCAT 数据库目标账号：\n'
+  printf '1) root（作为本机数据库缓存源）\n'
+  printf '2) 指定普通用户\n'
+  printf '0) 返回\n'
+  read -r -p "选择 [1]: " target
+  target="${target:-1}"
+
+  case "$target" in
+    1) user="root" ;;
+    2)
+      read -r -p "普通用户名: " user
+      [[ "$user" != "root" ]] || { warn "普通用户入口不能填写 root。"; return 1; }
+      ;;
+    0) return 0 ;;
+    *) warn "无效选择。"; return 1 ;;
+  esac
+
+  validate_simple_name "$user" || { warn "用户名格式不合法。"; return 1; }
+  id "$user" >/dev/null 2>&1 || { warn "用户 $user 不存在。"; return 1; }
+  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 1; }
+
+  read -r -p "数据库根目录 [$home/data_HD/metacat_db]: " db_root
+  db_root="${db_root:-$home/data_HD/metacat_db}"
+  [[ "$db_root" == "$home/"* ]] || { warn "数据库目录必须位于用户 $user 的 home 下。"; return 1; }
+  as_named_user "$user" mkdir -p "$db_root"
+
+  free_space="$(df -hP "$(dirname "$db_root")" 2>/dev/null | awk 'NR==2 {print $4 " free of " $2}' || true)"
+  info "数据库账号: $user"
+  info "数据库目录: $db_root"
+  info "可用空间: ${free_space:-未知}"
+
+  printf '\nMetaCAT 数据库管理：\n'
+  printf '1) 下载 / 配置 CheckM2 v1.1.0 数据库\n'
+  printf '2) 下载 / 配置 GTDB-Tk R232 数据库\n'
+  printf '3) 下载 / 配置全部数据库\n'
+  printf '4) 检查数据库状态\n'
+  printf '5) 修复环境变量\n'
+  printf '0) 返回\n'
+  read -r -p "选择: " choice
+
+  case "$choice" in
+    1) download_metacat_checkm2_db "$user" "$db_root" ;;
+    2) download_metacat_gtdb_r232_db "$user" "$db_root" ;;
+    3)
+      download_metacat_checkm2_db "$user" "$db_root"
+      download_metacat_gtdb_r232_db "$user" "$db_root"
+      ;;
+    4) show_metacat_db_status "$db_root" ;;
+    5)
+      configure_metacat_db_env "$user" "$db_root"
+      show_metacat_db_status "$db_root"
+      ;;
+    0) return 0 ;;
+    *) warn "无效选择。"; return 1 ;;
+  esac
 }
 
 install_metacat_for_user() {
@@ -2940,7 +3342,8 @@ show_menu() {
   printf ' 2) 一键新增用户（可同时安装 micromamba，自动 Miniconda 前置）\n'
   printf ' 3) 给 root / 普通用户安装 micromamba（自动安装 Miniconda 前置）\n'
   printf ' 4) 创建生信环境（RNASeq/ChIPSeq/WGS/scRNASeq/metaWRAP/MetaCAT）\n'
-  printf ' 5) metaWRAP 数据库下载 / 配置（选择用户和目录）\n'
+  printf ' 5) metaWRAP 数据库管理（root 缓存 / 普通用户本地复制）\n'
+  printf ' 6) MetaCAT 数据库管理（CheckM2 / GTDB-Tk R232）\n'
   printf '%s\n' '------------------------------------------------------------'
   printf '10) 系统 / 磁盘 / 网络检查\n'
   printf '11) 设置时区与 NTP\n'
@@ -2977,7 +3380,8 @@ main() {
       2) CURRENT_ACTION="one-click add user"; one_click_add_user; pause ;;
       3) CURRENT_ACTION="account micromamba"; install_micromamba_account_menu; pause ;;
       4) CURRENT_ACTION="bioinfo envs"; create_bioinfo_envs; pause ;;
-      5) CURRENT_ACTION="metaWRAP databases"; download_metawrap_databases_for_user; pause ;;
+      5) CURRENT_ACTION="metaWRAP databases"; manage_metawrap_databases; pause ;;
+      6) CURRENT_ACTION="MetaCAT databases"; manage_metacat_databases; pause ;;
       10) CURRENT_ACTION="preflight"; preflight; pause ;;
       11) CURRENT_ACTION="time"; configure_time; pause ;;
       12) CURRENT_ACTION="base packages"; install_base_packages; pause ;;
