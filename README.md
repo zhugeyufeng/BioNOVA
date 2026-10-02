@@ -43,8 +43,9 @@ BioNOVA 将 bioinfo-server-init.sh 内嵌为单个 Linux 可执行程序 bionova
 - Miniconda 仅作为 micromamba 自动前置
 - RNASeq / ChIPSeq / WGS / scRNASeq
 - metaWRAP
-- metaWRAP 数据库
+- metaWRAP 数据库（root 缓存 / 普通用户本地复制）
 - MetaCAT 官方 GitHub 最新 Release
+- MetaCAT 数据库（CheckM2 v1.1.0 / GTDB-Tk R232，支持 root 缓存）
 - Root SSH 仅公钥登录
 - 服务器健康检查
 
@@ -67,6 +68,8 @@ metacat-*-py3-none-any.whl
 然后在 Python 3.12 的独立 MetaCAT 环境中执行 pip upgrade。
 
 为兼容清华 Conda 镜像，micromamba 会设置 `use_sharded_repodata: false`，避免 shard index 缺失时的 fallback 告警。MetaCAT 版本校验也避免使用会提前关闭上游管道的 `awk ... exit` 写法，从而规避 rc=120。
+
+数据库管理采用 root 本地缓存模式：root 可先下载 `~/data_HD/metawrap_db` 与 `~/data_HD/metacat_db`；普通用户安装相同数据库时会优先从 `/root/data_HD/...` 本地复制并自动修复 owner、`config-metawrap`、`CHECKM2DB` 和 `GTDBTK_DATA_PATH`。
 
 ## 同步 Bash 源码
 
