@@ -1,0 +1,150 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Line endings
+        run: |
+          if grep -lI $'\r' assets/*.sh build.sh scripts/*.sh main.c; then
+            echo "CRLF line endings found" >&2
+            exit 1
+          fi
+
+      - name: bash -n
+        run: |
+          for f in assets/bioinfo-server-init.sh build.sh scripts/sync-script.sh; do
+            bash -n "$f"
+          done
+
+      - name: shellcheck
+        run: shellcheck -S error assets/bioinfo-server-init.sh build.sh scripts/sync-script.sh
+
+  build:
+    needs: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential python3 file
+
+      - name: Build static ELF
+        env:
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: ./build.sh
+
+      - name: Verify artifact
+        run: |
+          file dist/bionova | grep -q 'statically linked'
+          (cd dist && sha256sum -c bionova.sha256)
+          test "$(dist/bionova --script-sha256)" = "$(sha256sum assets/bioinfo-server-init.sh | awk '{print $1}')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bionova-linux-x86_64
+          path: |
+            dist/bionova
+            dist/bionova.sha256
+          if-no-files-found: error
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04"]
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bionova-linux-x86_64
+
+      - name: Basic commands
+        run: |
+          chmod 0755 bionova
+          ./bionova --version
+          ./bionova --help
+          ./bionova --script-sha256
+
+      - name: Dry-run menu exits cleanly
+        shell: bash
+        run: printf '0\n' | ./bionova --dry-run
+
+      - name: Invalid input returns to menu instead of exiting
+        shell: bash
+        run: |
+          out="$(printf '11\nInvalid/Zone\n\n0\n' | ./bionova --dry-run 2>&1)"
+          printf '%s\n' "$out"
+          grep -q '操作未完成: time' <<<"$out"
+          # 菜单在失败后被再次绘制，说明程序没有因 set -e 退出
+          test "$(grep -c '生信服务器开局助手' <<<"$out")" -ge 2
+
+      - name: Pressing Enter in root SSH menu installs nothing
+        shell: bash
+        run: |
+          out="$(printf '24\n\n\n0\n' | ./bionova --dry-run 2>&1)"
+          printf '%s\n' "$out"
+          ! grep -q 'append root SSH public key' <<<"$out"
+
+      - name: Root SSH key flow uses the provided key only
+        shell: bash
+        run: |
+          key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl ci@example'
+          out="$(printf '24\n1\n%s\ny\n\n0\n' "$key" | ./bionova --dry-run 2>&1)"
+          printf '%s\n' "$out"
+          grep -q 'append root SSH public key' <<<"$out"
+          ! grep -q 'noc.im' <<<"$out"
+
+      - name: Health check and group plan
+        shell: bash
+        run: |
+          printf '23\n\n0\n' | ./bionova --dry-run
+          out="$(printf '21\nn\n\n0\n' | ./bionova --dry-run 2>&1)"
+          printf '%s\n' "$out"
+          grep -q 'bioadmin' <<<"$out"
+
+      - name: No temp files left behind
+        shell: bash
+        run: |
+          leftovers="$(find /tmp -maxdepth 1 \( -name 'bionova-*' -o -name 'bioinfo-setup.*' \) -print)"
+          if [[ -n "$leftovers" ]]; then
+            echo "Leftover temp files:" >&2
+            printf '%s\n' "$leftovers" >&2
+            exit 1
+          fi
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: smoke
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bionova-linux-x86_64
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bionova
+            bionova.sha256
+          generate_release_notes: true

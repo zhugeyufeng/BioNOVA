@@ -1,2 +1,5 @@
+# Build outputs: binaries are published via GitHub Releases / Actions artifacts, not committed.
 .build/
 dist/
+/bionova
+/bionova.sha256

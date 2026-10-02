@@ -14,21 +14,24 @@ set -Eeuo pipefail
 # - Existing /bin/sh is intentionally left untouched.
 # - System files are only appended when the requested entry is not present.
 
-SCRIPT_NAME="$(basename "$0")"
+SCRIPT_NAME="${BIONOVA_NAME:-$(basename "$0")}"
+# bionova 通过 memfd 传入本脚本；bash 已自行打开脚本文件，关闭继承的描述符，避免泄漏给子进程。
+if [[ "${BIONOVA_SCRIPT_FD:-}" =~ ^[0-9]+$ ]]; then
+  eval "exec ${BIONOVA_SCRIPT_FD}<&-"
+fi
+unset BIONOVA_NAME BIONOVA_SCRIPT_FD
 DRY_RUN=0
 TIMEZONE_DEFAULT="Asia/Shanghai"
 DATA_MOUNT_DEFAULT="/data_disk"
 DATA_DEVICE_DEFAULT="/dev/sdb"
 MINIFORGE_DEFAULT="/opt/miniforge3"
 MINICONDA_SYSTEM_DEFAULT="/opt/miniconda3"
-MINICONDA_PREREQ_BIN=""
 MICROMAMBA_SYSTEM_BIN="/usr/local/bin/micromamba"
 URSKY_CHANNEL="https://conda.anaconda.org/ursky"
 TUNA_MAIN_CHANNEL="https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main"
 TUNA_R_CHANNEL="https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r"
 TUNA_CONDA_FORGE_CHANNEL="https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge"
 TUNA_BIOCONDA_CHANNEL="https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/bioconda"
-METACAT_RELEASE_API="https://api.github.com/repos/liu-congcong/MetaCAT/releases/latest"
 CHECKM2_DB_URL="https://zenodo.org/api/records/14897628/files/checkm2_database.tar.gz/content"
 CHECKM2_DB_MD5="07c10655620843b517d0df0c160d911f"
 GTDBTK_R232_URL="https://data.gtdb.ecogenomic.org/releases/release232/232.0/auxillary_files/gtdbtk_package/full_package/gtdbtk_r232_data.tar.gz"
@@ -36,11 +39,19 @@ GTDBTK_R232_MD5="25a59e0352b1fd150c589f56559767d4"
 METACAT_LATEST_TAG=""
 METACAT_LATEST_VERSION=""
 METACAT_LATEST_WHEEL=""
-DEFAULT_ROOT_SSH_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ5Ro/DSSqp52+GxXhMcf+3YaCK5ajt/Kq/viulNkh5a admin@noc.im"
+METACAT_LATEST_SHA256=""
+METACAT_WHEEL_LOCAL=""
+# 固定用户组与 GID。不使用 admin：Ubuntu 默认 sudoers 含 "%admin ALL=(ALL) ALL"。
+BIOINFO_GROUPS=(bioadmin sharevip primevip coursevip labvip)
+BIOINFO_GIDS=(30001 30002 30003 30004 30005)
 LOG_DIR="/var/log/bioinfo-setup"
 LOG_FILE=""
 CURRENT_ACTION="startup"
 LAST_CREATED_USER=""
+WORK_TMP=""
+ERR_LAST_SIG=""
+USER_ENV_PREFIX=""
+USER_ENV_CMD=()
 
 if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=1
@@ -58,30 +69,68 @@ on_error() {
   local rc=$?
   local line="${BASH_LINENO[0]:-unknown}"
   local cmd="${BASH_COMMAND:-unknown}"
-  printf '\033[1;31m[x]\033[0m action=%s rc=%s line=%s command=%q\n'     "${CURRENT_ACTION:-unknown}" "$rc" "$line" "$cmd" >&2
+  # 同一次失败会沿函数调用栈逐层触发 ERR，只报告最内层的那一次。
+  local sig="${BASH_SUBSHELL}:${rc}"
+  [[ "$ERR_LAST_SIG" != "$sig" ]] || return "$rc"
+  ERR_LAST_SIG="$sig"
+  printf '\033[1;31m[x]\033[0m action=%s rc=%s line=%s command=%q\n' "${CURRENT_ACTION:-unknown}" "$rc" "$line" "$cmd" >&2
   return "$rc"
 }
 
 trap on_error ERR
 
+# 在子 shell 中执行一个菜单动作：动作内部 errexit 始终生效（失败立即中止该动作），
+# 但失败只会返回菜单，不会退出整个程序。不能写成 "func || ..."，那样会让 func 内部的 set -e 失效。
+run_action() {
+  local label="$1"
+  shift
+  local rc=0
+  CURRENT_ACTION="$label"
+  trap - ERR
+  set +e
+  (
+    set -Eeuo pipefail
+    trap on_error ERR
+    "$@"
+  )
+  rc=$?
+  set -e
+  trap on_error ERR
+  if (( rc != 0 )); then
+    warn "操作未完成: $label (rc=$rc)，已返回菜单。"
+  fi
+  return 0
+}
+
+cleanup_work_tmp() {
+  if [[ -n "$WORK_TMP" && -d "$WORK_TMP" ]]; then
+    rm -rf -- "$WORK_TMP"
+  fi
+}
+
+# 私有临时目录（0700），替代 /tmp 下可被其他用户抢先创建或软链接的固定文件名。
+init_work_tmp() {
+  WORK_TMP="$(mktemp -d "${TMPDIR:-/tmp}/bioinfo-setup.XXXXXXXX")" || die "无法创建私有临时目录。"
+  chmod 0700 "$WORK_TMP"
+  trap cleanup_work_tmp EXIT
+}
+
 init_logging() {
-  local user
+  local user stamp
   user="$(login_user)"
+  stamp="$(date +%Y%m%d-%H%M%S)"
 
   if (( DRY_RUN )); then
-    LOG_FILE="/tmp/bioinfo-setup-dry-run-${user}-$(date +%Y%m%d-%H%M%S)-$$.log"
+    LOG_FILE="$(mktemp --suffix=.log "${TMPDIR:-/tmp}/bioinfo-setup-dry-run-${user}-${stamp}-XXXXXX")"
+  elif (( EUID == 0 )); then
+    install -d -m 0750 "$LOG_DIR"
+    LOG_FILE="$LOG_DIR/setup-${stamp}-$$.log"
+    install -m 0600 /dev/null "$LOG_FILE"
   else
-    if (( EUID == 0 )); then
-      mkdir -p "$LOG_DIR"
-      LOG_FILE="$LOG_DIR/setup-$(date +%Y%m%d-%H%M%S)-$$.log"
-      touch "$LOG_FILE"
-    else
-      command -v sudo >/dev/null 2>&1 || die "需要 sudo 创建日志目录 $LOG_DIR。"
-      sudo mkdir -p "$LOG_DIR"
-      LOG_FILE="$LOG_DIR/setup-$(date +%Y%m%d-%H%M%S)-$$.log"
-      sudo touch "$LOG_FILE"
-      sudo chown "$user:$(id -gn "$user")" "$LOG_FILE"
-    fi
+    command -v sudo >/dev/null 2>&1 || die "需要 sudo 创建日志目录 $LOG_DIR。"
+    sudo install -d -m 0750 "$LOG_DIR"
+    LOG_FILE="$LOG_DIR/setup-${stamp}-$$.log"
+    sudo install -m 0600 -o "$user" -g "$(id -gn "$user")" /dev/null "$LOG_FILE"
   fi
 
   [[ -n "$LOG_FILE" ]] || die "无法初始化日志文件。"
@@ -105,7 +154,7 @@ backup_file() {
 }
 
 pause() {
-  read -r -p "按 Enter 返回菜单..." _
+  read -r -p "按 Enter 返回菜单..." _ || true
 }
 
 confirm() {
@@ -136,6 +185,92 @@ as_root() {
     command -v sudo >/dev/null 2>&1 || die "需要 root 权限，但系统未安装 sudo。"
     run sudo "$@"
   fi
+}
+
+# 只读查询：即使在 dry-run 中也真实执行（不修改系统）。
+as_root_query() {
+  if (( EUID == 0 )); then
+    "$@"
+  elif ! command -v sudo >/dev/null 2>&1; then
+    die "需要 root 权限，但系统未安装 sudo。"
+  elif (( DRY_RUN )); then
+    # dry-run 不应为只读查询停下来索要 sudo 密码；没有缓存凭据时按查询失败处理。
+    sudo -n "$@" 2>/dev/null
+  else
+    sudo "$@"
+  fi
+}
+
+download_file() {
+  local url="$1" dest="$2"
+  if (( DRY_RUN )); then
+    printf '[dry-run] curl -fL %q -o %q\n' "$url" "$dest"
+    return 0
+  fi
+  curl -fL --retry 3 --retry-delay 5 "$url" -o "$dest"
+}
+
+verify_sha256() {
+  local file="$1" expected="${2:-}" actual
+  if (( DRY_RUN )); then
+    printf '[dry-run] verify sha256 of %q\n' "$file"
+    return 0
+  fi
+  if [[ -z "$expected" || "$expected" == "-" ]]; then
+    warn "发布方未提供 $(basename "$file") 的 sha256，仅依赖 HTTPS 传输校验。"
+    return 0
+  fi
+  expected="${expected,,}"
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { warn "无效的 sha256: $expected"; return 1; }
+  actual="$(as_root_query sha256sum -- "$file" | awk '{print $1}')"
+  if [[ "$actual" != "$expected" ]]; then
+    warn "sha256 校验失败: $file"
+    warn "  期望: $expected"
+    warn "  实际: $actual"
+    return 1
+  fi
+  info "sha256 校验通过: $(basename "$file")"
+}
+
+ensure_curl_python3() {
+  local -a missing=()
+  command -v curl >/dev/null 2>&1 || missing+=(curl)
+  command -v python3 >/dev/null 2>&1 || missing+=(python3)
+  (( ${#missing[@]} == 0 )) && return 0
+  # 输出到 stderr：本函数会在命令替换中被调用。
+  as_root apt-get update >&2
+  as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" >&2
+}
+
+# 查询 GitHub 项目 latest release 中名称完全匹配 pattern 的资产。
+# 输出 "<tag> <下载 URL> <sha256|->"；sha256 取自 GitHub 为资产计算的 digest。
+github_latest_asset() {
+  local repo="$1" pattern="$2" dry_name="$3" json
+  if (( DRY_RUN )); then
+    printf '[dry-run] query https://api.github.com/repos/%s/releases/latest\n' "$repo" >&2
+    printf 'latest https://github.com/%s/releases/latest/download/%s -\n' "$repo" "$dry_name"
+    return 0
+  fi
+  ensure_curl_python3
+  json="$(mktemp "$WORK_TMP/release.XXXXXX")"
+  curl -fsSL --retry 3 --retry-delay 3 "https://api.github.com/repos/$repo/releases/latest" -o "$json" || return 1
+  python3 - "$json" "$pattern" "$repo" <<'PY'
+import json, re, sys
+path, pattern, repo = sys.argv[1:4]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+tag = data.get("tag_name", "")
+prefix = f"https://github.com/{repo}/releases/download/"
+for asset in data.get("assets", []):
+    name = asset.get("name", "")
+    url = asset.get("browser_download_url", "")
+    digest = asset.get("digest") or ""
+    if tag and re.fullmatch(pattern, name) and url.startswith(prefix):
+        sha = digest[len("sha256:"):] if digest.startswith("sha256:") else "-"
+        print(tag, url, sha)
+        sys.exit(0)
+sys.exit(2)
+PY
 }
 
 login_user() {
@@ -312,14 +447,47 @@ validate_quota() {
 
 
 expected_bioinfo_group_gid() {
-  case "$1" in
-    admin) printf '110' ;;
-    sharevip) printf '30002' ;;
-    primevip) printf '30003' ;;
-    coursevip) printf '30004' ;;
-    labvip) printf '30005' ;;
-    *) return 1 ;;
-  esac
+  local i
+  for i in "${!BIOINFO_GROUPS[@]}"; do
+    if [[ "${BIOINFO_GROUPS[$i]}" == "$1" ]]; then
+      printf '%s' "${BIOINFO_GIDS[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_bioinfo_group() {
+  expected_bioinfo_group_gid "$1" >/dev/null
+}
+
+bioinfo_group_summary() {
+  local i out=""
+  for i in "${!BIOINFO_GROUPS[@]}"; do
+    out+="${BIOINFO_GROUPS[$i]}=${BIOINFO_GIDS[$i]}, "
+  done
+  printf '%s' "${out%, }"
+}
+
+# sudoers 中是否存在授予该组权限的规则（例如 Ubuntu 默认的 %admin、%sudo）。
+group_has_sudo_rule() {
+  local group="$1"
+  local -a files=(/etc/sudoers)
+  [[ -d /etc/sudoers.d ]] && files+=(/etc/sudoers.d)
+  as_root_query grep -RqsE "^[[:space:]]*%${group}[[:space:]]" "${files[@]}"
+}
+
+# 旧版本使用的 admin 组（GID 110）在 Ubuntu 默认 sudoers 中拥有 sudo 权限，提示人工迁移。
+warn_legacy_admin_group() {
+  local gid members
+  getent group admin >/dev/null 2>&1 || return 0
+  gid="$(getent group admin | cut -d: -f3)"
+  members="$(getent passwd | awk -F: -v g="$gid" '$4 == g {print $1}' | paste -sd, -)"
+  warn "检测到旧版 admin 组 (GID=$gid)。Ubuntu 默认 sudoers 的 \"%admin ALL=(ALL) ALL\" 会让其成员获得 sudo。"
+  if [[ -n "$members" ]]; then
+    warn "以 admin 为主组的用户: $members；如不应拥有 sudo，请迁移：usermod -g bioadmin <用户>"
+  fi
+  return 0
 }
 
 append_line_once() {
@@ -763,17 +931,13 @@ install_docker() {
 }
 
 install_rig_manager() {
-  local key_tmp="/tmp/rig.gpg"
+  local key_tmp="$WORK_TMP/rig.gpg"
   local repo='deb https://rig.r-pkg.org/deb rig main'
 
   as_root apt-get update
   as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates
 
-  if (( DRY_RUN )); then
-    printf '[dry-run] curl -fL https://rig.r-pkg.org/deb/rig.gpg -o %q\n' "$key_tmp"
-  else
-    curl -fL https://rig.r-pkg.org/deb/rig.gpg -o "$key_tmp"
-  fi
+  download_file https://rig.r-pkg.org/deb/rig.gpg "$key_tmp"
   as_root install -m 0644 "$key_tmp" /etc/apt/trusted.gpg.d/rig.gpg
   write_root_file /etc/apt/sources.list.d/rig.list "$repo"
 
@@ -854,8 +1018,51 @@ install_r_for_bootstrap() {
   fi
 }
 
+r_list_installed() {
+  ensure_rig
+  as_root rig list
+}
+
+r_list_available() {
+  ensure_rig
+  rig available
+}
+
+r_add_version() {
+  local target
+  ensure_rig
+  printf '可输入 release / oldrel / devel / next，或精确版本如 4.5.1。\n'
+  read -r -p "要安装的 R 版本 [release]: " target
+  [[ -n "$target" ]] || target="release"
+  as_root rig add "$target"
+  if confirm "将 $target 设为默认 R？" "Y"; then
+    as_root rig default "$target"
+    sync_rstudio_r_path
+  fi
+}
+
+r_set_default() {
+  local target
+  ensure_rig
+  as_root rig list
+  read -r -p "设为默认的版本号/别名: " target
+  [[ -n "$target" ]] || { warn "版本不能为空。"; return 1; }
+  as_root rig default "$target"
+  sync_rstudio_r_path
+}
+
+r_remove_version() {
+  local target
+  ensure_rig
+  as_root rig list
+  read -r -p "要删除的版本号: " target
+  [[ -n "$target" ]] || { warn "版本不能为空。"; return 1; }
+  confirm "确认删除 R $target？" || { warn "已取消。"; return 0; }
+  as_root rig rm "$target"
+}
+
 install_r() {
-  local choice target current
+  local choice current
 
   while true; do
     current="$(R --version 2>/dev/null | head -1 || true)"
@@ -871,57 +1078,16 @@ install_r() {
     printf '6) 删除指定 R 版本\n'
     printf '7) 安装当前默认 R 的常用 CRAN/Bioconductor 包\n'
     printf '0) 返回主菜单\n'
-    read -r -p "选择: " choice
+    read -r -p "选择: " choice || return 0
 
     case "$choice" in
-      1)
-        CURRENT_ACTION="R: install rig"
-        install_rig_manager
-        ;;
-      2)
-        CURRENT_ACTION="R: list installed"
-        ensure_rig || continue
-        as_root rig list
-        ;;
-      3)
-        CURRENT_ACTION="R: list available"
-        ensure_rig || continue
-        rig available
-        ;;
-      4)
-        CURRENT_ACTION="R: add version"
-        ensure_rig || continue
-        printf '可输入 release / oldrel / devel / next，或精确版本如 4.5.1。\n'
-        read -r -p "要安装的 R 版本 [release]: " target
-        [[ -n "$target" ]] || target="release"
-        as_root rig add "$target"
-        if confirm "将 $target 设为默认 R？" "Y"; then
-          as_root rig default "$target"
-          sync_rstudio_r_path
-        fi
-        ;;
-      5)
-        CURRENT_ACTION="R: set default"
-        ensure_rig || continue
-        as_root rig list
-        read -r -p "设为默认的版本号/别名: " target
-        [[ -n "$target" ]] || { warn "版本不能为空。"; continue; }
-        as_root rig default "$target"
-        sync_rstudio_r_path
-        ;;
-      6)
-        CURRENT_ACTION="R: remove version"
-        ensure_rig || continue
-        as_root rig list
-        read -r -p "要删除的版本号: " target
-        [[ -n "$target" ]] || { warn "版本不能为空。"; continue; }
-        confirm "确认删除 R $target？" || continue
-        as_root rig rm "$target"
-        ;;
-      7)
-        CURRENT_ACTION="R: common packages"
-        install_common_r_packages
-        ;;
+      1) run_action "R: install rig" install_rig_manager ;;
+      2) run_action "R: list installed" r_list_installed ;;
+      3) run_action "R: list available" r_list_available ;;
+      4) run_action "R: add version" r_add_version ;;
+      5) run_action "R: set default" r_set_default ;;
+      6) run_action "R: remove version" r_remove_version ;;
+      7) run_action "R: common packages" install_common_r_packages ;;
       0)
         CURRENT_ACTION="main menu"
         return 0
@@ -936,7 +1102,7 @@ install_r() {
 install_rstudio() {
   local releases_url="https://dailies.rstudio.com/release/"
   local download_base="https://download2.rstudio.org/server/jammy/amd64"
-  local tmp="/tmp/rstudio-server.deb"
+  local tmp="$WORK_TMP/rstudio-server.deb"
   local current_version target_version file_version url action choice manual_version r_bin
   local backup_dir="" installed=0
   local -a versions=()
@@ -1098,11 +1264,7 @@ install_rstudio() {
     log "RStudio 配置已备份到 $backup_dir"
   fi
 
-  if (( DRY_RUN )); then
-    printf '[dry-run] curl -fL %q -o %q\n' "$url" "$tmp"
-  else
-    curl -fL "$url" -o "$tmp"
-  fi
+  download_file "$url" "$tmp"
 
   if (( installed )); then
     if command -v rstudio-server >/dev/null 2>&1; then
@@ -1149,7 +1311,7 @@ install_rstudio() {
 }
 
 install_miniforge() {
-  local prefix arch url installer
+  local prefix arch asset out tag url sha installer
   read -r -p "Miniforge 安装目录 [$MINIFORGE_DEFAULT]: " prefix
   prefix="${prefix:-$MINIFORGE_DEFAULT}"
   [[ "$prefix" == /* ]] || { warn "安装目录必须是绝对路径。"; return 1; }
@@ -1160,17 +1322,17 @@ install_miniforge() {
     *) warn "不支持的架构: $(uname -m)"; return 1 ;;
   esac
 
-  url="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-${arch}.sh"
-  installer="/tmp/miniforge-installer.sh"
+  asset="Miniforge3-Linux-${arch}.sh"
+  installer="$WORK_TMP/$asset"
 
   if [[ -x "$prefix/bin/conda" ]]; then
     info "$prefix 已存在 conda，跳过安装。"
   else
-    if (( DRY_RUN )); then
-      printf '[dry-run] curl -fL %q -o %q\n' "$url" "$installer"
-    else
-      curl -fL "$url" -o "$installer"
-    fi
+    out="$(github_latest_asset conda-forge/miniforge "Miniforge3-Linux-${arch}\\.sh" "$asset")"
+    read -r tag url sha <<<"$out"
+    info "Miniforge 官方 Release: $tag"
+    download_file "$url" "$installer"
+    verify_sha256 "$installer" "$sha"
     as_root bash "$installer" -b -p "$prefix"
   fi
 
@@ -1201,12 +1363,10 @@ find_conda_config_manager() {
 configure_tuna_conda_mirrors() {
   local scope
   local home condarc manager manager_name channel
+  # 只配置 conda-forge + bioconda：pkgs/main、pkgs/r 是 Anaconda defaults 的镜像，受 Anaconda 服务条款约束。
   local -a channels=(
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main"
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r"
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/msys2"
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge"
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/bioconda"
+    "$TUNA_CONDA_FORGE_CHANNEL"
+    "$TUNA_BIOCONDA_CHANNEL"
   )
 
   home="$(login_home)"
@@ -1238,15 +1398,12 @@ configure_tuna_conda_mirrors() {
   if [[ -z "$manager" ]]; then
     if [[ -e "$condarc" ]]; then
       warn "检测到已有 $condarc，但系统没有 conda/micromamba 可用于安全合并。"
-      warn "已保留原文件并创建备份；请先安装 micromamba（会自动准备 Miniconda 前置）或 Miniforge 后重试。"
+      warn "已保留原文件并创建备份；请先安装 micromamba 或 Miniforge 后重试。"
       return 1
     fi
 
     local content_new='show_channel_urls: true
 channels:
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/msys2
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/bioconda'
     if [[ "$scope" == "2" || "$scope" == "system" ]]; then
@@ -1317,6 +1474,7 @@ channels:
   log "清华 Conda/Bioconda 源已无损合并到 $condarc"
 }
 
+# 仅用于兼容：识别旧版本作为 micromamba "前置" 安装的 Miniconda，以便继续使用其中已有的环境。
 find_named_user_miniconda() {
   local user="$1"
   local home candidate marker_prefix="" shell_conda="" base=""
@@ -1355,42 +1513,6 @@ find_named_user_miniconda() {
   return 1
 }
 
-configure_tuna_for_named_user() {
-  local user="$1"
-  local conda_bin="$2"
-  local home condarc channel
-  local -a channels=(
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main"
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r"
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/msys2"
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge"
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/bioconda"
-  )
-
-  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
-  if [[ -z "$home" ]] && (( DRY_RUN )) && [[ "$user" == "$LAST_CREATED_USER" ]]; then
-    home="/home/$user"
-  fi
-  [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 1; }
-  condarc="$home/.condarc"
-  [[ -e "$condarc" ]] && backup_file "$condarc"
-  as_named_user "$user" touch "$condarc"
-  as_named_user "$user" "$conda_bin" config --file "$condarc" --set show_channel_urls true
-
-  for channel in "${channels[@]}"; do
-    if ! as_named_user "$user" "$conda_bin" config --file "$condarc" --show channels 2>/dev/null | grep -Fq -- "$channel"; then
-      as_named_user "$user" "$conda_bin" config --file "$condarc" --append channels "$channel"
-    fi
-  done
-
-  if grep -Eq '^[[:space:]]*-[[:space:]]*defaults[[:space:]]*$' "$condarc" 2>/dev/null; then
-    as_named_user "$user" "$conda_bin" config --file "$condarc" --remove channels defaults
-    info "已从 $condarc 移除 defaults，避免访问 repo.anaconda.com 触发 ToS。"
-  fi
-
-  log "已为用户 $user 配置清华 Conda/Bioconda 源。"
-}
-
 find_named_user_micromamba() {
   local user="$1" home candidate marker_bin="" shell_bin=""
   home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
@@ -1424,71 +1546,92 @@ find_named_user_micromamba() {
   return 1
 }
 
-install_miniconda_prerequisite_for_account() {
-  local user="$1" home prefix arch url installer conda_bin existing=""
-  MINICONDA_PREREQ_BIN=""
-
-  validate_simple_name "$user" || { warn "用户名格式不合法。"; return 1; }
-  if id "$user" >/dev/null 2>&1; then
-    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
-  elif (( DRY_RUN )) && [[ "$user" == "$LAST_CREATED_USER" ]]; then
+user_home_dir() {
+  local user="$1" home
+  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+  if [[ -z "$home" ]] && (( DRY_RUN )) && [[ "$user" == "$LAST_CREATED_USER" ]]; then
     home="/home/$user"
-  else
-    warn "用户 $user 不存在。"
-    return 1
   fi
   [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 1; }
+  printf '%s' "$home"
+}
 
-  existing="$(find_named_user_miniconda "$user" 2>/dev/null || true)"
-  if [[ -n "$existing" ]]; then
-    info "Miniconda 前置条件已满足: user=$user path=$existing"
-    if (( DRY_RUN == 0 )); then
-      info "Miniconda 版本: $("$existing" --version 2>/dev/null || true)"
+# 以目标用户身份调用其 micromamba（~/data_HD/bin/micromamba，root prefix ~/data_HD/micromamba）。
+user_micromamba() {
+  local user="$1" home
+  shift
+  home="$(user_home_dir "$user")"
+  as_named_user "$user" env MAMBA_ROOT_PREFIX="$home/data_HD/micromamba" "$home/data_HD/bin/micromamba" "$@"
+}
+
+ensure_user_micromamba() {
+  local user="$1" home
+  home="$(user_home_dir "$user")"
+  [[ -x "$home/data_HD/bin/micromamba" ]] && return 0
+  warn "用户 $user 尚未安装 micromamba，先行安装。"
+  install_micromamba_for_account "$user"
+}
+
+# 解析在用户某个环境中执行命令的方式：优先 micromamba 环境，兼容旧版本创建在 Miniconda 中的环境。
+# 结果写入 USER_ENV_CMD（命令前缀）与 USER_ENV_PREFIX（环境目录）。
+resolve_user_env() {
+  local user="$1" env_name="$2" home root_prefix legacy legacy_prefix
+  home="$(user_home_dir "$user")" || return 1
+  root_prefix="$home/data_HD/micromamba"
+  USER_ENV_PREFIX="$root_prefix/envs/$env_name"
+  USER_ENV_CMD=(env MAMBA_ROOT_PREFIX="$root_prefix" "$home/data_HD/bin/micromamba" run -n "$env_name")
+  [[ -d "$USER_ENV_PREFIX" ]] && return 0
+
+  legacy="$(find_named_user_miniconda "$user" 2>/dev/null || true)"
+  if [[ -n "$legacy" ]]; then
+    legacy_prefix="$(dirname "$(dirname "$legacy")")/envs/$env_name"
+    if [[ -d "$legacy_prefix" ]]; then
+      USER_ENV_PREFIX="$legacy_prefix"
+      USER_ENV_CMD=("$legacy" run -n "$env_name")
     fi
-    MINICONDA_PREREQ_BIN="$existing"
-    return 0
   fi
+  return 0
+}
 
-  case "$(uname -m)" in
-    x86_64) arch="x86_64" ;;
-    aarch64|arm64) arch="aarch64" ;;
-    *) warn "不支持的架构: $(uname -m)"; return 1 ;;
-  esac
+user_env_exists() {
+  resolve_user_env "$1" "$2" && [[ -d "$USER_ENV_PREFIX" ]]
+}
 
-  prefix="$home/data_HD/miniconda3"
-  url="https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-latest-Linux-${arch}.sh"
-  installer="/tmp/miniconda-prereq-${user}-${arch}.sh"
+user_env_exec() {
+  local user="$1" env_name="$2"
+  shift 2
+  resolve_user_env "$user" "$env_name"
+  as_named_user "$user" "${USER_ENV_CMD[@]}" "$@"
+}
 
-  info "未检测到 $user 的 Miniconda；作为 micromamba 前置条件自动安装到 $prefix"
-  as_named_user "$user" mkdir -p "$home/data_HD"
-  if (( DRY_RUN )); then
-    printf '[dry-run] curl -fL %q -o %q\n' "$url" "$installer"
-  else
-    curl -fL "$url" -o "$installer"
-    chmod 0755 "$installer"
-  fi
-  as_named_user "$user" bash "$installer" -b -p "$prefix"
+user_env_exec_in_dir() {
+  local user="$1" dir="$2" env_name="$3"
+  shift 3
+  resolve_user_env "$user" "$env_name"
+  as_named_user_in_dir "$user" "$dir" "${USER_ENV_CMD[@]}" "$@"
+}
 
-  conda_bin="$prefix/bin/conda"
-  append_named_user_line_once "$user" "$home/.bashrc" "export PATH=\"$prefix/bin:\$PATH\""
-  as_named_user "$user" "$conda_bin" init bash
-  configure_tuna_for_named_user "$user" "$conda_bin"
-  as_named_user "$user" mkdir -p "$home/.config/bioinfo-setup"
-  write_named_user_file "$user" "$home/.config/bioinfo-setup/miniconda.prefix" "$prefix"
-  MINICONDA_PREREQ_BIN="$conda_bin"
-  log "Miniconda 前置条件安装完成: user=$user prefix=$prefix"
+# 为用户 micromamba 写入镜像频道（conda-forge 优先于 bioconda）。不在全局设置 strict，
+# 以免影响 metaWRAP 这类依赖旧频道组合的环境；需要 strict 的环境在创建时单独指定。
+configure_user_micromamba() {
+  local user="$1" binary="$2" root_prefix="$3" channel
+  local -a mm=(env MAMBA_ROOT_PREFIX="$root_prefix" "$binary")
+  as_named_user "$user" "${mm[@]}" config set use_sharded_repodata false
+  for channel in "$TUNA_CONDA_FORGE_CHANNEL" "$TUNA_BIOCONDA_CHANNEL"; do
+    if (( DRY_RUN )) || ! as_named_user "$user" "${mm[@]}" config list 2>/dev/null | grep -Fq -- "$channel"; then
+      as_named_user "$user" "${mm[@]}" config append channels "$channel"
+    fi
+  done
 }
 
 install_micromamba_for_account() {
-  local user="$1" home arch api_arch url archive tmpdir bin_dir binary root_prefix group existing="" conda_bin
+  local user="$1" home asset out tag url sha bin_dir binary root_prefix existing="" reinstall=0
 
   validate_simple_name "$user" || { warn "用户名格式不合法。"; return 1; }
   if id "$user" >/dev/null 2>&1; then
     home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
-    group="$(id -gn "$user" 2>/dev/null || printf '%s' "$user")"
   elif (( DRY_RUN )) && [[ "$user" == "$LAST_CREATED_USER" ]]; then
     home="/home/$user"
-    group="sharevip"
   else
     warn "用户 $user 不存在。"
     return 1
@@ -1499,51 +1642,42 @@ install_micromamba_for_account() {
   if [[ -n "$existing" ]]; then
     printf '\n检测到 %s 已安装 micromamba：\n' "$user"
     printf '  路径: %s\n' "$existing"
-    printf '  版本: %s\n' "$("$existing" --version 2>/dev/null || true)"
+    if (( DRY_RUN == 0 )); then
+      # 该文件位于用户可写目录，必须以该用户身份执行，不能由 root 直接运行。
+      printf '  版本: %s\n' "$(as_named_user "$user" "$existing" --version 2>/dev/null || true)"
+    fi
     if confirm "是否跳过 $user 的 micromamba 安装？" "Y"; then
       return 0
     fi
+    reinstall=1
   fi
 
-  install_miniconda_prerequisite_for_account "$user" || return 1
-  conda_bin="$MINICONDA_PREREQ_BIN"
-  [[ -n "$conda_bin" ]] || { warn "Miniconda 前置条件未满足。"; return 1; }
-
   case "$(uname -m)" in
-    x86_64) api_arch="linux-64" ;;
-    aarch64|arm64) api_arch="linux-aarch64" ;;
+    x86_64) asset="micromamba-linux-64" ;;
+    aarch64|arm64) asset="micromamba-linux-aarch64" ;;
     *) warn "不支持的架构: $(uname -m)"; return 1 ;;
   esac
 
-  url="https://micro.mamba.pm/api/micromamba/${api_arch}/latest"
-  archive="/tmp/micromamba-${user}-${api_arch}.tar.bz2"
-  tmpdir="/tmp/micromamba-${user}-extract-$$"
   bin_dir="$home/data_HD/bin"
   binary="$bin_dir/micromamba"
   root_prefix="$home/data_HD/micromamba"
 
+  # micromamba 是独立的静态可执行文件，不需要 Miniconda 作为前置。
+  # 下载与安装均以目标用户身份完成，root 不向用户可控目录写文件。
   as_named_user "$user" mkdir -p "$bin_dir" "$root_prefix"
-  if [[ ! -x "$binary" ]]; then
-    if (( DRY_RUN )); then
-      printf '[dry-run] curl -fL %q -o %q\n' "$url" "$archive"
-      printf '[dry-run] extract bin/micromamba and install to %q as %q\n' "$binary" "$user"
-    else
-      curl -fL "$url" -o "$archive"
-      rm -rf "$tmpdir"
-      mkdir -p "$tmpdir"
-      tar -xjf "$archive" -C "$tmpdir" bin/micromamba
-      if [[ "$user" == "root" ]]; then
-        install -m 0755 "$tmpdir/bin/micromamba" "$binary"
-      else
-        install -o "$user" -g "$group" -m 0755 "$tmpdir/bin/micromamba" "$binary"
-      fi
-      rm -rf "$tmpdir" "$archive"
-    fi
+  if [[ ! -x "$binary" ]] || (( reinstall )); then
+    out="$(github_latest_asset mamba-org/micromamba-releases "$asset" "$asset")"
+    read -r tag url sha <<<"$out"
+    info "micromamba 官方 Release: $tag"
+    as_named_user "$user" curl -fL --retry 3 --retry-delay 5 "$url" -o "$binary.download"
+    verify_sha256 "$binary.download" "$sha"
+    as_named_user "$user" chmod 0755 "$binary.download"
+    as_named_user "$user" mv -f "$binary.download" "$binary"
   fi
 
   append_named_user_line_once "$user" "$home/.bashrc" 'export PATH="$HOME/data_HD/bin:$PATH"'
   as_named_user "$user" env MAMBA_ROOT_PREFIX="$root_prefix" "$binary" shell init -s bash -r "$root_prefix"
-  as_named_user "$user" env MAMBA_ROOT_PREFIX="$root_prefix" "$binary" config set use_sharded_repodata false
+  configure_user_micromamba "$user" "$binary" "$root_prefix"
   as_named_user "$user" mkdir -p "$home/.config/bioinfo-setup"
   write_named_user_file "$user" "$home/.config/bioinfo-setup/micromamba.bin" "$binary"
 
@@ -1576,55 +1710,42 @@ install_micromamba_account_menu() {
 }
 
 install_metawrap_for_account() {
-  local user="$1" home conda_bin env_name="metaWRAP"
+  local user="$1" env_name="metaWRAP"
 
   validate_simple_name "$user" || { warn "用户名格式不合法。"; return 1; }
   id "$user" >/dev/null 2>&1 || { warn "用户 $user 不存在。"; return 1; }
 
-  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
-  [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 1; }
-
-  conda_bin="$(find_named_user_miniconda "$user" 2>/dev/null || true)"
-  if [[ -z "$conda_bin" ]]; then
-    warn "用户 $user 尚未满足 micromamba 前置条件；先安装 micromamba（会自动安装 Miniconda 前置）。"
-    install_micromamba_for_account "$user" || return 1
-    if (( DRY_RUN )); then
-      conda_bin="$home/data_HD/miniconda3/bin/conda"
-    else
-      conda_bin="$(find_named_user_miniconda "$user" 2>/dev/null || true)"
-    fi
-  fi
-  [[ -n "$conda_bin" ]] || { warn "无法找到用户 $user 的 Miniconda conda。"; return 1; }
-
-  if (( DRY_RUN == 0 )) && as_named_user "$user" "$conda_bin" env list 2>/dev/null | awk '{print $1}' | grep -Fxq "$env_name"; then
-    info "用户 $user 的 $env_name 环境已存在，跳过创建。"
+  if (( DRY_RUN == 0 )) && user_env_exists "$user" "$env_name"; then
+    info "用户 $user 的 $env_name 环境已存在（$USER_ENV_PREFIX），跳过创建。"
     return 0
   fi
 
-  info "为账号 $user 创建 metaWRAP 1.3.2 独立环境。"
+  ensure_user_micromamba "$user"
+
+  info "为账号 $user 创建 metaWRAP 1.3.2 独立环境（micromamba）。"
   info "按 metaWRAP 上游建议使用 ursky channel；数据库配置不在本步骤自动下载。"
-  as_named_user "$user" "$conda_bin" create -y -n "$env_name" --override-channels \
+  user_micromamba "$user" create -y -n "$env_name" --override-channels \
     -c "$URSKY_CHANNEL" \
     -c "$TUNA_BIOCONDA_CHANNEL" \
     -c "$TUNA_CONDA_FORGE_CHANNEL" \
     -c "$TUNA_MAIN_CHANNEL" \
     -c "$TUNA_R_CHANNEL" \
     metawrap-mg=1.3.2 maxbin2=2.2.6
-  as_named_user "$user" "$conda_bin" install -y -n "$env_name" --override-channels \
+  user_micromamba "$user" install -y -n "$env_name" --override-channels \
     -c "$TUNA_MAIN_CHANNEL" \
     -c "$TUNA_R_CHANNEL" \
     -c "$TUNA_CONDA_FORGE_CHANNEL" \
     blas=2.5=mkl
 
   if (( DRY_RUN == 0 )); then
-    as_named_user "$user" "$conda_bin" run -n "$env_name" metawrap --help >/dev/null 2>&1 || {
+    user_env_exec "$user" "$env_name" metawrap --help >/dev/null 2>&1 || {
       warn "metaWRAP 环境创建完成，但 metawrap --help 验证失败，请查看日志。"
       return 1
     }
   fi
 
   log "metaWRAP 安装完成: user=$user env=$env_name"
-  info "用户登录后可执行: conda activate $env_name"
+  info "用户登录后可执行: micromamba activate $env_name"
 }
 
 install_metawrap_for_user() {
@@ -1680,19 +1801,19 @@ create_metawrap_for_login_user() {
 }
 
 metawrap_config_set_for_user() {
-  local user="$1" conda_bin="$2" key="$3" value="$4"
-  local config_file conda_prefix
+  local user="$1" key="$2" value="$3"
+  local config_file
+
+  resolve_user_env "$user" metaWRAP
+  config_file="$USER_ENV_PREFIX/bin/config-metawrap"
 
   if (( DRY_RUN )); then
-    conda_prefix="$(dirname "$(dirname "$conda_bin")")"
-    config_file="$conda_prefix/envs/metaWRAP/bin/config-metawrap"
     printf '[dry-run] set %s=%q in %q as %q\n' "$key" "$value" "$config_file" "$user"
     return 0
   fi
 
-  config_file="$(as_named_user "$user" "$conda_bin" run -n metaWRAP which config-metawrap 2>/dev/null || true)"
-  [[ -n "$config_file" && -f "$config_file" ]] || {
-    warn "找不到用户 $user 的 metaWRAP config-metawrap。"
+  [[ -f "$config_file" ]] || {
+    warn "找不到用户 $user 的 metaWRAP config-metawrap: $config_file"
     return 1
   }
 
@@ -1705,30 +1826,38 @@ metawrap_config_set_for_user() {
   info "config-metawrap: $key=$value"
 }
 
+# 返回值：0=已复制；1=不适用或用户拒绝（调用方应改为下载）；2=复制失败。
 copy_root_database_tree() {
   local user="$1" source="$2" dest="$3" label="$4"
-  local home group
+  local home
 
   [[ "$user" != "root" ]] || return 1
   home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
-  [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 1; }
-  [[ "$source" == /root/data_HD/* ]] || { warn "拒绝复制非 root 数据库缓存路径: $source"; return 1; }
-  [[ "$dest" == "$home/"* ]] || { warn "目标数据库路径必须位于 $home 下: $dest"; return 1; }
+  [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 2; }
+  [[ "$source" == /root/data_HD/* ]] || { warn "拒绝复制非 root 数据库缓存路径: $source"; return 2; }
+  [[ "$dest" == "$home/"* ]] || { warn "目标数据库路径必须位于 $home 下: $dest"; return 2; }
   [[ -d "$source" ]] || return 1
 
   if ! confirm "检测到 root 本地 $label，优先复制到用户 $user？" "Y"; then
     return 1
   fi
 
-  command -v rsync >/dev/null 2>&1 || {
-    as_root apt-get update
-    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y rsync
-  }
+  # root 只读取受信任的缓存源；写入端以目标用户身份运行，
+  # 这样用户 home 中预置的符号链接无法把 root 引导到系统目录写文件或 chown。
+  if ! as_named_user "$user" mkdir -p "$dest"; then
+    warn "无法以用户 $user 身份创建 $dest"
+    return 2
+  fi
+  if (( DRY_RUN )); then
+    printf '[dry-run] (root) tar -C %q -cf - . | (as %q) tar -C %q -xf -\n' "$source" "$user" "$dest"
+    return 0
+  fi
 
-  group="$(id -gn "$user" 2>/dev/null || printf '%s' "$user")"
-  as_root mkdir -p "$dest"
-  as_root rsync -a --info=progress2 "$source/" "$dest/"
-  as_root chown -R "$user:$group" "$dest"
+  info "正在复制 $label（数据量大时耗时较长）..."
+  if ! as_root tar -C "$source" -cf - . | as_named_user "$user" tar -C "$dest" -xf -; then
+    warn "从 root 本地缓存复制 $label 失败: $source -> $dest"
+    return 2
+  fi
   log "已从 root 本地缓存复制 $label: $source -> $dest"
 }
 
@@ -1796,13 +1925,16 @@ show_metawrap_db_status() {
 }
 
 download_metawrap_checkm_db() {
-  local user="$1" conda_bin="$2" db_root="$3"
+  local user="$1" db_root="$2"
   local dir="$db_root/CheckM" archive="$db_root/CheckM/checkm_data_2015_01_16.tar.gz"
-  if maybe_copy_metawrap_db_from_root "$user" "$db_root" checkm; then
-    as_named_user "$user" "$conda_bin" run -n metaWRAP checkm data setRoot "$dir"
+  local copy_rc=0
+  maybe_copy_metawrap_db_from_root "$user" "$db_root" checkm || copy_rc=$?
+  if (( copy_rc == 0 )); then
+    user_env_exec "$user" metaWRAP checkm data setRoot "$dir"
     log "CheckM 数据库已从 root 本地缓存复制并配置: $dir"
     return 0
   fi
+  (( copy_rc == 1 )) || return "$copy_rc"
   as_named_user "$user" mkdir -p "$dir"
   if [[ -e "$dir/.bioinfo-download-complete" ]]; then
     info "CheckM 数据库已存在，跳过下载: $dir"
@@ -1812,47 +1944,53 @@ download_metawrap_checkm_db() {
     as_named_user "$user" rm -f "$archive"
     as_named_user "$user" touch "$dir/.bioinfo-download-complete"
   fi
-  as_named_user "$user" "$conda_bin" run -n metaWRAP checkm data setRoot "$dir"
+  user_env_exec "$user" metaWRAP checkm data setRoot "$dir"
   log "CheckM 数据库配置完成: $dir"
 }
 
 download_metawrap_kraken2_db() {
-  local user="$1" conda_bin="$2" db_root="$3" threads="$4"
+  local user="$1" db_root="$2" threads="$3"
   local dir="$db_root/KRAKEN2"
-  if maybe_copy_metawrap_db_from_root "$user" "$db_root" kraken2; then
-    metawrap_config_set_for_user "$user" "$conda_bin" KRAKEN2_DB "$dir"
+  local copy_rc=0
+  maybe_copy_metawrap_db_from_root "$user" "$db_root" kraken2 || copy_rc=$?
+  if (( copy_rc == 0 )); then
+    metawrap_config_set_for_user "$user" KRAKEN2_DB "$dir"
     log "Kraken2 数据库已从 root 本地缓存复制并配置: $dir"
     return 0
   fi
+  (( copy_rc == 1 )) || return "$copy_rc"
   warn "Kraken2 standard 数据库需要大量磁盘和内存；官方 metaWRAP 文档给出的量级约 125GB，构建阶段资源需求较高。"
   confirm "确认下载并构建 Kraken2 standard 数据库？" || return 0
   as_named_user "$user" mkdir -p "$dir"
   if [[ ! -e "$dir/hash.k2d" || ! -e "$dir/opts.k2d" || ! -e "$dir/taxo.k2d" ]]; then
-    as_named_user "$user" "$conda_bin" run -n metaWRAP kraken2-build --standard --threads "$threads" --db "$dir"
+    user_env_exec "$user" metaWRAP kraken2-build --standard --threads "$threads" --db "$dir"
   else
     info "Kraken2 数据库核心文件已存在，跳过构建。"
   fi
-  metawrap_config_set_for_user "$user" "$conda_bin" KRAKEN2_DB "$dir"
+  metawrap_config_set_for_user "$user" KRAKEN2_DB "$dir"
   log "Kraken2 数据库配置完成: $dir"
 }
 
 download_metawrap_ncbi_nt_db() {
-  local user="$1" conda_bin="$2" db_root="$3"
+  local user="$1" db_root="$2"
   local dir="$db_root/NCBI_nt"
-  if maybe_copy_metawrap_db_from_root "$user" "$db_root" nt; then
-    metawrap_config_set_for_user "$user" "$conda_bin" BLASTDB "$dir"
+  local copy_rc=0
+  maybe_copy_metawrap_db_from_root "$user" "$db_root" nt || copy_rc=$?
+  if (( copy_rc == 0 )); then
+    metawrap_config_set_for_user "$user" BLASTDB "$dir"
     log "NCBI nt 数据库已从 root 本地缓存复制并配置: $dir"
     return 0
   fi
+  (( copy_rc == 1 )) || return "$copy_rc"
   warn "NCBI nt 是超大型、多卷且持续更新的数据库；请确保目标目录有充足可用空间。"
   confirm "确认下载/更新 NCBI nt BLAST 数据库？" || return 0
   as_named_user "$user" mkdir -p "$dir"
-  if ! as_named_user "$user" "$conda_bin" run -n metaWRAP which update_blastdb.pl >/dev/null 2>&1; then
+  if ! user_env_exec "$user" metaWRAP which update_blastdb.pl >/dev/null 2>&1; then
     warn "metaWRAP 环境中找不到 update_blastdb.pl，无法使用 NCBI 官方推荐下载方式。"
     return 1
   fi
   local blastdb_rc=0
-  if as_named_user_in_dir "$user" "$dir" "$conda_bin" run -n metaWRAP update_blastdb.pl --decompress nt; then
+  if user_env_exec_in_dir "$user" "$dir" metaWRAP update_blastdb.pl --decompress nt; then
     blastdb_rc=0
   else
     blastdb_rc=$?
@@ -1862,34 +2000,40 @@ download_metawrap_ncbi_nt_db() {
     fi
     info "update_blastdb.pl 返回 1：表示本次成功下载了数据库文件。"
   fi
-  metawrap_config_set_for_user "$user" "$conda_bin" BLASTDB "$dir"
+  metawrap_config_set_for_user "$user" BLASTDB "$dir"
   log "NCBI nt 数据库配置完成: $dir"
 }
 
 download_metawrap_ncbi_tax_db() {
-  local user="$1" conda_bin="$2" db_root="$3"
+  local user="$1" db_root="$2"
   local dir="$db_root/NCBI_tax" archive="$db_root/NCBI_tax/taxdump.tar.gz"
-  if maybe_copy_metawrap_db_from_root "$user" "$db_root" taxonomy; then
-    metawrap_config_set_for_user "$user" "$conda_bin" TAXDUMP "$dir"
+  local copy_rc=0
+  maybe_copy_metawrap_db_from_root "$user" "$db_root" taxonomy || copy_rc=$?
+  if (( copy_rc == 0 )); then
+    metawrap_config_set_for_user "$user" TAXDUMP "$dir"
     log "NCBI taxonomy 已从 root 本地缓存复制并配置: $dir"
     return 0
   fi
+  (( copy_rc == 1 )) || return "$copy_rc"
   as_named_user "$user" mkdir -p "$dir"
   as_named_user "$user" curl -fL --retry 3 --retry-delay 5 "https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz" -o "$archive"
   as_named_user "$user" tar -xzf "$archive" -C "$dir"
   as_named_user "$user" rm -f "$archive"
-  metawrap_config_set_for_user "$user" "$conda_bin" TAXDUMP "$dir"
+  metawrap_config_set_for_user "$user" TAXDUMP "$dir"
   log "NCBI taxonomy 配置完成: $dir"
 }
 
 download_metawrap_bmtagger_db() {
-  local user="$1" conda_bin="$2" db_root="$3"
+  local user="$1" db_root="$2"
   local dir="$db_root/BMTAGGER_INDEX"
-  if maybe_copy_metawrap_db_from_root "$user" "$db_root" bmtagger; then
-    metawrap_config_set_for_user "$user" "$conda_bin" BMTAGGER_DB "$dir"
+  local copy_rc=0
+  maybe_copy_metawrap_db_from_root "$user" "$db_root" bmtagger || copy_rc=$?
+  if (( copy_rc == 0 )); then
+    metawrap_config_set_for_user "$user" BMTAGGER_DB "$dir"
     log "BMTAGGER hg38 索引已从 root 本地缓存复制并配置: $dir"
     return 0
   fi
+  (( copy_rc == 1 )) || return "$copy_rc"
   warn "hg38 BMTAGGER 索引下载与构建需要较大磁盘/内存；官方 metaWRAP 文档给出的索引量级约 20GB。"
   confirm "确认下载 hg38 并构建 BMTAGGER 索引？" || return 0
   as_named_user "$user" mkdir -p "$dir"
@@ -1898,17 +2042,17 @@ download_metawrap_bmtagger_db() {
     as_named_user_in_dir "$user" "$dir" bash -c 'for f in chr*.fa.gz; do gzip -df "$f"; done; cat chr*.fa > hg38.fa'
   fi
   if [[ ! -e "$dir/hg38.bitmask" ]]; then
-    as_named_user "$user" "$conda_bin" run -n metaWRAP bmtool -d "$dir/hg38.fa" -o "$dir/hg38.bitmask"
+    user_env_exec "$user" metaWRAP bmtool -d "$dir/hg38.fa" -o "$dir/hg38.bitmask"
   fi
   if [[ ! -e "$dir/hg38.srprism" ]]; then
-    as_named_user "$user" "$conda_bin" run -n metaWRAP srprism mkindex -i "$dir/hg38.fa" -o "$dir/hg38.srprism" -M 100000
+    user_env_exec "$user" metaWRAP srprism mkindex -i "$dir/hg38.fa" -o "$dir/hg38.srprism" -M 100000
   fi
-  metawrap_config_set_for_user "$user" "$conda_bin" BMTAGGER_DB "$dir"
+  metawrap_config_set_for_user "$user" BMTAGGER_DB "$dir"
   log "BMTAGGER hg38 索引配置完成: $dir"
 }
 
 manage_metawrap_databases() {
-  local target user="" home conda_bin db_root choice threads free_space
+  local target user="" home db_root choice threads free_space
 
   printf '\nmetaWRAP 数据库目标账号：\n'
   printf '1) root（作为本机数据库缓存源）\n'
@@ -1933,22 +2077,10 @@ manage_metawrap_databases() {
   home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
   [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 1; }
 
-  conda_bin="$(find_named_user_miniconda "$user" 2>/dev/null || true)"
-  if [[ -z "$conda_bin" ]]; then
-    warn "用户 $user 没有 Miniconda；先安装 micromamba（自动安装 Miniconda 前置）。"
-    install_micromamba_for_account "$user" || return 1
-    if (( DRY_RUN )); then
-      conda_bin="$home/data_HD/miniconda3/bin/conda"
-    else
-      conda_bin="$(find_named_user_miniconda "$user" 2>/dev/null || true)"
-    fi
-  fi
-  [[ -n "$conda_bin" ]] || { warn "无法找到 $user 的 Miniconda。"; return 1; }
-
-  if (( DRY_RUN == 0 )) && ! as_named_user "$user" "$conda_bin" env list 2>/dev/null | awk '{print $1}' | grep -Fxq metaWRAP; then
+  if (( DRY_RUN == 0 )) && ! user_env_exists "$user" metaWRAP; then
     warn "账号 $user 尚未创建 metaWRAP 环境。"
     if confirm "现在先为 $user 安装 metaWRAP？" "Y"; then
-      install_metawrap_for_account "$user" || return 1
+      install_metawrap_for_account "$user"
     else
       return 0
     fi
@@ -1988,19 +2120,19 @@ manage_metawrap_databases() {
   as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget tar gzip
 
   case "$choice" in
-    1) download_metawrap_checkm_db "$user" "$conda_bin" "$db_root" ;;
-    2) download_metawrap_kraken2_db "$user" "$conda_bin" "$db_root" "$threads" ;;
-    3) download_metawrap_ncbi_nt_db "$user" "$conda_bin" "$db_root" ;;
-    4) download_metawrap_ncbi_tax_db "$user" "$conda_bin" "$db_root" ;;
-    5) download_metawrap_bmtagger_db "$user" "$conda_bin" "$db_root" ;;
+    1) download_metawrap_checkm_db "$user" "$db_root" ;;
+    2) download_metawrap_kraken2_db "$user" "$db_root" "$threads" ;;
+    3) download_metawrap_ncbi_nt_db "$user" "$db_root" ;;
+    4) download_metawrap_ncbi_tax_db "$user" "$db_root" ;;
+    5) download_metawrap_bmtagger_db "$user" "$db_root" ;;
     6)
       warn "全部数据库可能占用数百 GB，并包含高内存构建步骤。"
       confirm "确认继续下载/构建全部数据库？" || return 0
-      download_metawrap_checkm_db "$user" "$conda_bin" "$db_root"
-      download_metawrap_kraken2_db "$user" "$conda_bin" "$db_root" "$threads"
-      download_metawrap_ncbi_nt_db "$user" "$conda_bin" "$db_root"
-      download_metawrap_ncbi_tax_db "$user" "$conda_bin" "$db_root"
-      download_metawrap_bmtagger_db "$user" "$conda_bin" "$db_root"
+      download_metawrap_checkm_db "$user" "$db_root"
+      download_metawrap_kraken2_db "$user" "$db_root" "$threads"
+      download_metawrap_ncbi_nt_db "$user" "$db_root"
+      download_metawrap_ncbi_tax_db "$user" "$db_root"
+      download_metawrap_bmtagger_db "$user" "$db_root"
       ;;
     7) show_metawrap_db_status "$db_root" ;;
     0) return 0 ;;
@@ -2009,49 +2141,20 @@ manage_metawrap_databases() {
 }
 
 resolve_metacat_latest_release() {
-  local tmp
+  local out name
   METACAT_LATEST_TAG=""
   METACAT_LATEST_VERSION=""
   METACAT_LATEST_WHEEL=""
+  METACAT_LATEST_SHA256=""
 
-  command -v curl >/dev/null 2>&1 || {
-    as_root apt-get update
-    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y curl
-  }
-  command -v python3 >/dev/null 2>&1 || {
-    as_root apt-get update
-    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y python3
-  }
-
-  tmp="/tmp/metacat-release-$$.json"
-  if (( DRY_RUN )); then
-    printf '[dry-run] query latest MetaCAT release from %s\n' "$METACAT_RELEASE_API"
+  if ! out="$(github_latest_asset liu-congcong/MetaCAT 'metacat-.+-py3-none-any\.whl' 'metacat-latest-py3-none-any.whl')"; then
+    warn "无法从官方 GitHub latest release 解析 MetaCAT wheel。"
+    return 1
   fi
-  curl -fsSL --retry 3 --retry-delay 3 "$METACAT_RELEASE_API" -o "$tmp"
-
-  read -r METACAT_LATEST_TAG METACAT_LATEST_VERSION METACAT_LATEST_WHEEL < <(
-    python3 - "$tmp" <<'PY'
-import json, re, sys
-path = sys.argv[1]
-with open(path, "r", encoding="utf-8") as fh:
-    data = json.load(fh)
-tag = data.get("tag_name", "")
-wheel = ""
-version = ""
-for asset in data.get("assets", []):
-    name = asset.get("name", "")
-    url = asset.get("browser_download_url", "")
-    m = re.fullmatch(r"metacat-(.+)-py3-none-any\.whl", name)
-    if m and url.startswith("https://github.com/liu-congcong/MetaCAT/releases/download/"):
-        version = m.group(1)
-        wheel = url
-        break
-if not (tag and version and wheel):
-    sys.exit(2)
-print(tag, version, wheel)
-PY
-  )
-  rm -f "$tmp"
+  read -r METACAT_LATEST_TAG METACAT_LATEST_WHEEL METACAT_LATEST_SHA256 <<<"$out"
+  name="${METACAT_LATEST_WHEEL##*/}"
+  name="${name#metacat-}"
+  METACAT_LATEST_VERSION="${name%-py3-none-any.whl}"
 
   [[ -n "$METACAT_LATEST_TAG" && -n "$METACAT_LATEST_VERSION" && -n "$METACAT_LATEST_WHEEL" ]] || {
     warn "无法从官方 GitHub latest release 解析 MetaCAT wheel。"
@@ -2060,6 +2163,17 @@ PY
 
   info "MetaCAT 官方最新 Release: tag=$METACAT_LATEST_TAG version=$METACAT_LATEST_VERSION"
   info "MetaCAT wheel: $METACAT_LATEST_WHEEL"
+}
+
+# 以目标用户身份把 wheel 下载到其 ~/.cache，并按 GitHub digest 校验后再交给 pip。
+fetch_metacat_wheel_for_user() {
+  local user="$1" home cache
+  home="$(user_home_dir "$user")"
+  cache="$home/.cache/bioinfo-setup"
+  METACAT_WHEEL_LOCAL="$cache/${METACAT_LATEST_WHEEL##*/}"
+  as_named_user "$user" mkdir -p "$cache"
+  as_named_user "$user" curl -fL --retry 3 --retry-delay 5 "$METACAT_LATEST_WHEEL" -o "$METACAT_WHEEL_LOCAL"
+  verify_sha256 "$METACAT_WHEEL_LOCAL" "${METACAT_LATEST_SHA256:--}"
 }
 
 set_named_user_export() {
@@ -2152,7 +2266,9 @@ download_metacat_checkm2_db() {
   local dir="$db_root/checkm2" archive="$db_root/checkm2/checkm2_database.tar.gz"
   local found=""
 
-  if maybe_copy_metacat_db_from_root "$user" "$db_root" checkm2; then
+  local copy_rc=0
+  maybe_copy_metacat_db_from_root "$user" "$db_root" checkm2 || copy_rc=$?
+  if (( copy_rc == 0 )); then
     if (( DRY_RUN )); then
       set_named_user_export "$user" CHECKM2DB "$db_root/checkm2/uniref100.KO.1.dmnd"
     else
@@ -2161,6 +2277,7 @@ download_metacat_checkm2_db() {
     log "CheckM2 数据库已从 root 本地缓存复制并配置。"
     return 0
   fi
+  (( copy_rc == 1 )) || return "$copy_rc"
 
   if metacat_db_ready "$db_root" checkm2; then
     info "CheckM2 数据库已存在，跳过下载。"
@@ -2196,7 +2313,9 @@ download_metacat_gtdb_r232_db() {
   local dir="$db_root/gtdbtk" archive="$db_root/gtdbtk/gtdbtk_r232_data.tar.gz"
   local release_dir=""
 
-  if maybe_copy_metacat_db_from_root "$user" "$db_root" gtdbtk; then
+  local copy_rc=0
+  maybe_copy_metacat_db_from_root "$user" "$db_root" gtdbtk || copy_rc=$?
+  if (( copy_rc == 0 )); then
     if (( DRY_RUN )); then
       set_named_user_export "$user" GTDBTK_DATA_PATH "$db_root/gtdbtk/r232"
     else
@@ -2205,6 +2324,7 @@ download_metacat_gtdb_r232_db() {
     log "GTDB-Tk R232 数据库已从 root 本地缓存复制并配置。"
     return 0
   fi
+  (( copy_rc == 1 )) || return "$copy_rc"
 
   if metacat_db_ready "$db_root" gtdbtk; then
     info "GTDB-Tk R232 数据库已存在，跳过下载。"
@@ -2331,24 +2451,25 @@ install_metacat_for_user() {
   home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
   [[ -n "$home" ]] || { warn "无法读取用户 $user 的 home。"; return 1; }
 
-  install_micromamba_for_account "$user" || return 1
+  install_micromamba_for_account "$user"
   mm="$home/data_HD/bin/micromamba"
   root_prefix="$home/data_HD/micromamba"
   env_dir="$root_prefix/envs/MetaCAT"
 
-  resolve_metacat_latest_release || return 1
+  resolve_metacat_latest_release
+  fetch_metacat_wheel_for_user "$user"
 
   if [[ ! -d "$env_dir" ]]; then
-    as_named_user "$user" env MAMBA_ROOT_PREFIX="$root_prefix" "$mm" create -y -n MetaCAT --override-channels \
+    as_named_user "$user" env MAMBA_ROOT_PREFIX="$root_prefix" "$mm" create -y -n MetaCAT \
+      --override-channels --strict-channel-priority \
       -c "$TUNA_CONDA_FORGE_CHANNEL" \
-      -c "$TUNA_MAIN_CHANNEL" \
       python=3.12 pip
   else
     info "用户 $user 的 MetaCAT 环境已存在，将升级到官方最新 Release。"
   fi
 
   as_named_user "$user" env MAMBA_ROOT_PREFIX="$root_prefix" "$mm" run -n MetaCAT \
-    python -m pip install --upgrade "$METACAT_LATEST_WHEEL"
+    python -m pip install --upgrade "$METACAT_WHEEL_LOCAL"
 
   if (( DRY_RUN == 0 )); then
     as_named_user "$user" env MAMBA_ROOT_PREFIX="$root_prefix" "$mm" run -n MetaCAT MetaCAT --help >/dev/null 2>&1 || {
@@ -2371,18 +2492,19 @@ create_metacat_for_login_user() {
   local manager_type="$1" manager_bin="$2" home="$3" root_prefix="$4" base_prefix="$5"
   local env_exists=0 installed_version=""
 
-  resolve_metacat_latest_release || return 1
+  resolve_metacat_latest_release
+  fetch_metacat_wheel_for_user "$(login_user)"
 
   if [[ "$manager_type" == "micromamba" ]]; then
     [[ -d "$root_prefix/envs/MetaCAT" ]] && env_exists=1
     if (( ! env_exists )); then
-      as_login_user env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" create -y -n MetaCAT --override-channels \
+      as_login_user env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" create -y -n MetaCAT \
+        --override-channels --strict-channel-priority \
         -c "$TUNA_CONDA_FORGE_CHANNEL" \
-        -c "$TUNA_MAIN_CHANNEL" \
         python=3.12 pip
     fi
     as_login_user env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" run -n MetaCAT \
-      python -m pip install --upgrade "$METACAT_LATEST_WHEEL"
+      python -m pip install --upgrade "$METACAT_WHEEL_LOCAL"
     if (( DRY_RUN == 0 )); then
       as_login_user env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" run -n MetaCAT MetaCAT --help >/dev/null 2>&1 || return 1
       installed_version="$(as_login_user env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" run -n MetaCAT python -m pip show metacat 2>/dev/null | awk '/^Version:/ {value=$2} END {print value}')"
@@ -2390,12 +2512,12 @@ create_metacat_for_login_user() {
   else
     [[ -d "$base_prefix/envs/MetaCAT" || -d "$home/.conda/envs/MetaCAT" ]] && env_exists=1
     if (( ! env_exists )); then
-      as_login_user "$manager_bin" create -y -n MetaCAT --override-channels \
+      as_login_user "$manager_bin" create -y -n MetaCAT \
+        --override-channels --strict-channel-priority \
         -c "$TUNA_CONDA_FORGE_CHANNEL" \
-        -c "$TUNA_MAIN_CHANNEL" \
         python=3.12 pip
     fi
-    as_login_user "$manager_bin" run -n MetaCAT python -m pip install --upgrade "$METACAT_LATEST_WHEEL"
+    as_login_user "$manager_bin" run -n MetaCAT python -m pip install --upgrade "$METACAT_WHEEL_LOCAL"
     if (( DRY_RUN == 0 )); then
       as_login_user "$manager_bin" run -n MetaCAT MetaCAT --help >/dev/null 2>&1 || return 1
       installed_version="$(as_login_user "$manager_bin" run -n MetaCAT python -m pip show metacat 2>/dev/null | awk '/^Version:/ {value=$2} END {print value}')"
@@ -2552,18 +2674,37 @@ create_bioinfo_envs() {
       return 0
     fi
 
+    # Bioconda 官方要求 conda-forge 优先于 bioconda，并使用 strict channel priority。
     if [[ "$manager_type" == "micromamba" ]]; then
-      as_login_user env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" create -y -n "$name" -c conda-forge -c bioconda "$@"
+      as_login_user env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" create -y -n "$name" \
+        --strict-channel-priority -c conda-forge -c bioconda "$@"
     else
-      as_login_user "$manager_bin" create -y -n "$name" -c conda-forge -c bioconda "$@"
+      as_login_user "$manager_bin" create -y -n "$name" --strict-channel-priority -c conda-forge -c bioconda "$@"
     fi
+    export_env_lock "$name"
+  }
+
+  # 记录实际解析出的完整版本，便于在其他服务器上用 env create -f 复现同一环境。
+  export_env_lock() {
+    local name="$1" lock_dir="$home/.config/bioinfo-setup/env-locks" lock
+    lock="$lock_dir/${name}-$(date +%Y%m%d-%H%M%S).yml"
+    as_login_user mkdir -p "$lock_dir"
+    if [[ "$manager_type" == "micromamba" ]]; then
+      as_login_user bash -c 'out="$1"; shift; "$@" > "$out"' _ "$lock" \
+        env MAMBA_ROOT_PREFIX="$root_prefix" "$manager_bin" env export -n "$name" \
+        || { warn "导出环境锁定文件失败: $name"; return 0; }
+    else
+      as_login_user bash -c 'out="$1"; shift; "$@" > "$out"' _ "$lock" "$manager_bin" env export -n "$name" \
+        || { warn "导出环境锁定文件失败: $name"; return 0; }
+    fi
+    info "环境锁定文件: $lock"
   }
 
   case "$choice" in
-    1) create_env RNASeq python=3 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread cufflinks bedtools seqkit ;;
-    2) create_env ChIPSeq python=3 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread bedtools deeptools seqkit macs2 ;;
-    3) create_env WGS python=3 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa minimap2 star hisat2 htseq subread bedtools deeptools seqkit bcftools ;;
-    4) create_env scRNASeq python=3 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread bedtools seqkit scanpy python-igraph leidenalg scvelo celltypist scrublet velocyto.py scirpy ;;
+    1) create_env RNASeq python=3.11 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread stringtie bedtools seqkit ;;
+    2) create_env ChIPSeq python=3.11 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread bedtools deeptools seqkit macs3 ;;
+    3) create_env WGS python=3.11 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa minimap2 star hisat2 htseq subread bedtools deeptools seqkit bcftools ;;
+    4) create_env scRNASeq python=3.11 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread bedtools seqkit scanpy python-igraph leidenalg scvelo celltypist scrublet velocyto.py scirpy ;;
     5)
       create_metawrap_for_login_user "$manager_type" "$manager_bin" "$home" "$root_prefix" "${base_prefix:-}"
       ;;
@@ -2571,10 +2712,10 @@ create_bioinfo_envs() {
       create_metacat_for_login_user "$manager_type" "$manager_bin" "$home" "$root_prefix" "${base_prefix:-}"
       ;;
     7)
-      create_env RNASeq python=3 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread cufflinks bedtools seqkit
-      create_env ChIPSeq python=3 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread bedtools deeptools seqkit macs2
-      create_env WGS python=3 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa minimap2 star hisat2 htseq subread bedtools deeptools seqkit bcftools
-      create_env scRNASeq python=3 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread bedtools seqkit scanpy python-igraph leidenalg scvelo celltypist scrublet velocyto.py scirpy
+      create_env RNASeq python=3.11 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread stringtie bedtools seqkit
+      create_env ChIPSeq python=3.11 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread bedtools deeptools seqkit macs3
+      create_env WGS python=3.11 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa minimap2 star hisat2 htseq subread bedtools deeptools seqkit bcftools
+      create_env scRNASeq python=3.11 samtools fastqc multiqc cutadapt fastp bowtie bowtie2 bwa star hisat2 htseq subread bedtools seqkit scanpy python-igraph leidenalg scvelo celltypist scrublet velocyto.py scirpy
       ;;
     *)
       warn "无效选择。"
@@ -2586,14 +2727,12 @@ create_bioinfo_envs() {
 }
 
 init_groups() {
-  local -a groups=(admin sharevip primevip coursevip labvip)
-  local -a gids=(110 30002 30003 30004 30005)
   local group gid existing_gid used_by i
 
   printf '\n=== 用户组 GID 规划 ===\n'
-  for i in "${!groups[@]}"; do
-    group="${groups[$i]}"
-    gid="${gids[$i]}"
+  for i in "${!BIOINFO_GROUPS[@]}"; do
+    group="${BIOINFO_GROUPS[$i]}"
+    gid="${BIOINFO_GIDS[$i]}"
 
     if getent group "$group" >/dev/null 2>&1; then
       existing_gid="$(getent group "$group" | cut -d: -f3)"
@@ -2612,12 +2751,13 @@ init_groups() {
       printf '%-12s create   GID=%s\n' "$group" "$gid"
     fi
   done
+  warn_legacy_admin_group
 
   confirm "确认按以上固定 GID 创建所有缺失组？" || { warn "已取消。"; return 0; }
 
-  for i in "${!groups[@]}"; do
-    group="${groups[$i]}"
-    gid="${gids[$i]}"
+  for i in "${!BIOINFO_GROUPS[@]}"; do
+    group="${BIOINFO_GROUPS[$i]}"
+    gid="${BIOINFO_GIDS[$i]}"
     if getent group "$group" >/dev/null 2>&1; then
       info "组已存在: $group (GID=$gid)"
     else
@@ -2625,7 +2765,7 @@ init_groups() {
     fi
   done
 
-  log "用户组初始化完成：admin=110, sharevip=30002, primevip=30003, coursevip=30004, labvip=30005。"
+  log "用户组初始化完成：$(bioinfo_group_summary)。"
 }
 
 rollback_user_creation() {
@@ -2664,6 +2804,7 @@ create_user() {
   local username user_type requested_uid expected_gid primary_gid
   local home_soft home_hard data_soft data_hard expiry data_mount
   local user_home data_dir r_ver rprofile_line home_fs data_fs actual_uid actual_gid q
+  local i
   local -a useradd_args=(-m -s /bin/bash)
 
   read -r -p "新用户名: " username
@@ -2678,22 +2819,17 @@ create_user() {
   fi
 
   printf '\n可选用户主组：\n'
-  printf '  admin      (GID 110)\n'
-  printf '  sharevip   (GID 30002)\n'
-  printf '  primevip   (GID 30003)\n'
-  printf '  coursevip  (GID 30004)\n'
-  printf '  labvip     (GID 30005)\n'
+  for i in "${!BIOINFO_GROUPS[@]}"; do
+    printf '  %-10s (GID %s)\n' "${BIOINFO_GROUPS[$i]}" "${BIOINFO_GIDS[$i]}"
+  done
   read -r -p "用户类型/主组 [sharevip]: " user_type
   [[ -n "$user_type" ]] || user_type="sharevip"
 
-  case "$user_type" in
-    admin|sharevip|primevip|coursevip|labvip) ;;
-    *)
-      warn "不支持的用户主组: $user_type"
-      warn "仅允许：admin, sharevip, primevip, coursevip, labvip。"
-      return 1
-      ;;
-  esac
+  if ! is_bioinfo_group "$user_type"; then
+    warn "不支持的用户主组: $user_type"
+    warn "仅允许：${BIOINFO_GROUPS[*]}。"
+    return 1
+  fi
 
   if getent group "$user_type" >/dev/null 2>&1; then
     primary_gid="$(getent group "$user_type" | cut -d: -f3)"
@@ -2706,6 +2842,10 @@ create_user() {
   fi
 
   info "主组 $user_type 当前/计划 GID: $primary_gid"
+  if group_has_sudo_rule "$user_type"; then
+    warn "sudoers 中存在 %$user_type 规则：以该组为主组的用户将直接获得 sudo 权限。"
+    confirm "仍以 $user_type 作为主组创建用户？" || { warn "已取消。"; return 0; }
+  fi
 
   read -r -p "指定 UID（留空自动分配；集群建议显式指定）: " requested_uid
   if [[ -n "$requested_uid" ]]; then
@@ -2858,7 +2998,7 @@ create_user() {
 }
 
 configure_root_ssh_key_login() {
-  local key_choice public_key fingerprint
+  local key_choice public_key="" key_file fingerprint
   local sshd_bin="/usr/sbin/sshd"
   local dropin="/etc/ssh/sshd_config.d/00-bioinfo-root-key.conf"
   local dropin_backup="" timestamp config_content
@@ -2872,18 +3012,24 @@ configure_root_ssh_key_login() {
   fi
 
   printf '\nRoot SSH 公钥登录：\n'
-  printf '1) 使用内置 admin@noc.im 公钥\n'
-  printf '2) 手动输入其他公钥\n'
+  printf '1) 粘贴你自己的 SSH 公钥（单行）\n'
+  printf '2) 从公钥文件读取（例如 /home/<用户>/.ssh/id_ed25519.pub）\n'
   printf '0) 取消\n'
-  read -r -p "选择 [1]: " key_choice
-  key_choice="${key_choice:-1}"
+  read -r -p "选择 [0]: " key_choice
+  key_choice="${key_choice:-0}"
 
   case "$key_choice" in
     1)
-      public_key="$DEFAULT_ROOT_SSH_KEY"
+      read -r -p "粘贴 SSH 公钥（单行）: " public_key
       ;;
     2)
-      read -r -p "粘贴 SSH 公钥（单行）: " public_key
+      read -r -p "公钥文件路径: " key_file
+      [[ -f "$key_file" && -r "$key_file" ]] || { warn "无法读取公钥文件: $key_file"; return 1; }
+      if [[ "$(grep -cvE '^[[:space:]]*(#|$)' "$key_file" || true)" != "1" ]]; then
+        warn "公钥文件必须恰好包含一行公钥。"
+        return 1
+      fi
+      public_key="$(grep -vE '^[[:space:]]*(#|$)' "$key_file")"
       ;;
     0)
       return 0
@@ -2894,14 +3040,15 @@ configure_root_ssh_key_login() {
       ;;
   esac
 
-  [[ "$public_key" == ssh-* || "$public_key" == sk-ssh-* ]] || {
+  public_key="${public_key%$'\r'}"
+  [[ "$public_key" == ssh-* || "$public_key" == sk-ssh-* || "$public_key" == ecdsa-sha2-* ]] || {
     warn "公钥格式不正确。"
     return 1
   }
 
   local key_tmp
   if command -v ssh-keygen >/dev/null 2>&1; then
-    key_tmp="$(mktemp /tmp/bioinfo-root-key.XXXXXX)"
+    key_tmp="$(mktemp "$WORK_TMP/root-key.XXXXXX")"
     chmod 600 "$key_tmp"
     printf '%s\n' "$public_key" > "$key_tmp"
     if ! fingerprint="$(ssh-keygen -lf "$key_tmp" 2>/dev/null)"; then
@@ -2943,7 +3090,7 @@ PermitRootLogin prohibit-password'
     printf '[dry-run] %q -t -f /etc/ssh/sshd_config\n' "$sshd_bin"
     printf '[dry-run] %q -T -C user=root,host=localhost,addr=127.0.0.1\n' "$sshd_bin"
   else
-    if ! "$sshd_bin" -t -f /etc/ssh/sshd_config; then
+    if ! as_root "$sshd_bin" -t -f /etc/ssh/sshd_config; then
       warn "sshd 配置语法校验失败，恢复 SSH 配置。"
       if [[ -n "$dropin_backup" ]]; then
         as_root cp -a "$dropin_backup" "$dropin"
@@ -2953,8 +3100,8 @@ PermitRootLogin prohibit-password'
       return 1
     fi
 
-    effective_root="$("$sshd_bin" -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null | awk '$1=="permitrootlogin" {value=$2} END {print value}')"
-    effective_pubkey="$("$sshd_bin" -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null | awk '$1=="pubkeyauthentication" {value=$2} END {print value}')"
+    effective_root="$(as_root "$sshd_bin" -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null | awk '$1=="permitrootlogin" {value=$2} END {print value}')"
+    effective_pubkey="$(as_root "$sshd_bin" -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null | awk '$1=="pubkeyauthentication" {value=$2} END {print value}')"
 
     case "$effective_root" in
       prohibit-password|without-password) ;;
@@ -2982,14 +3129,14 @@ PermitRootLogin prohibit-password'
   fi
 
   as_root install -d -m 0700 -o root -g root /root/.ssh
-  if [[ -e "$auth_keys" ]]; then
+  if as_root_query test -e "$auth_keys"; then
     auth_existed=1
     auth_backup="${auth_keys}.bak.${timestamp}"
     as_root cp -a "$auth_keys" "$auth_backup"
     info "已备份 authorized_keys: $auth_backup"
   fi
 
-  if grep -Fqx -- "$public_key" "$auth_keys" 2>/dev/null; then
+  if as_root_query grep -Fqx -- "$public_key" "$auth_keys" 2>/dev/null; then
     info "该公钥已存在于 $auth_keys，未重复添加。"
   elif (( DRY_RUN )); then
     printf '[dry-run] append root SSH public key to %q\n' "$auth_keys"
@@ -3008,7 +3155,7 @@ PermitRootLogin prohibit-password'
   if (( DRY_RUN )); then
     printf '[dry-run] systemctl reload ssh || systemctl enable --now ssh\n'
   else
-    "$sshd_bin" -t -f /etc/ssh/sshd_config
+    as_root "$sshd_bin" -t -f /etc/ssh/sshd_config
     if systemctl is-active --quiet ssh 2>/dev/null; then
       if ! as_root systemctl reload ssh; then
         warn "SSH reload 失败，恢复刚才的配置。"
@@ -3056,7 +3203,7 @@ health_status() {
 
 health_check() {
   local data_fs data_opts docker_ver r_ver rstudio_ver rstudio_state rstudio_r current_r
-  local home manager env_output group missing_groups=0 bad_groups=0 expected_gid actual_group_gid ssh_state ssh_root ssh_pubkey ssh_key_state
+  local home manager env_output group i missing_groups=0 bad_groups=0 expected_gid actual_group_gid ssh_state ssh_root ssh_pubkey ssh_key_state
 
   printf '\n============================================================\n'
   printf ' 生信服务器健康检查\n'
@@ -3148,14 +3295,9 @@ health_check() {
   fi
 
   printf '\n--- 用户组 ---\n'
-  for group in admin sharevip primevip coursevip labvip; do
-    case "$group" in
-      admin) expected_gid=110 ;;
-      sharevip) expected_gid=30002 ;;
-      primevip) expected_gid=30003 ;;
-      coursevip) expected_gid=30004 ;;
-      labvip) expected_gid=30005 ;;
-    esac
+  for i in "${!BIOINFO_GROUPS[@]}"; do
+    group="${BIOINFO_GROUPS[$i]}"
+    expected_gid="${BIOINFO_GIDS[$i]}"
 
     if getent group "$group" >/dev/null 2>&1; then
       actual_group_gid="$(getent group "$group" | cut -d: -f3)"
@@ -3172,9 +3314,12 @@ health_check() {
   done
 
   if (( missing_groups == 0 && bad_groups == 0 )); then
-    health_status "用户组" "OK" "5 个组均存在且 GID 正确"
+    health_status "用户组" "OK" "${#BIOINFO_GROUPS[@]} 个组均存在且 GID 正确"
   else
     health_status "用户组" "WARN" "缺失=$missing_groups GID错误=$bad_groups"
+  fi
+  if getent group admin >/dev/null 2>&1; then
+    health_status "旧 admin 组" "WARN" "Ubuntu sudoers 默认授予 %admin sudo；建议迁移到 bioadmin"
   fi
 
   printf '\n--- SSH ---\n'
@@ -3196,12 +3341,13 @@ health_check() {
     fi
     health_status "SSH pubkey auth" "$([[ "$ssh_pubkey" == "yes" ]] && printf OK || printf WARN)" "PubkeyAuthentication=${ssh_pubkey:-unknown}"
     if (( DRY_RUN )); then
-      ssh_key_state="未检查（dry-run）"
-      health_status "admin@noc.im key" "INFO" "$ssh_key_state"
-    elif as_root grep -Fqx -- "$DEFAULT_ROOT_SSH_KEY" /root/.ssh/authorized_keys 2>/dev/null; then
-      health_status "admin@noc.im key" "OK" "已授权 root"
+      health_status "root 授权公钥" "INFO" "未检查（dry-run）"
+    elif as_root_query test -s /root/.ssh/authorized_keys; then
+      ssh_key_state="$(as_root_query ssh-keygen -lf /root/.ssh/authorized_keys 2>/dev/null || true)"
+      health_status "root 授权公钥" "INFO" "$(printf '%s\n' "$ssh_key_state" | grep -c . || true) 个，请确认均为可信公钥："
+      printf '%s\n' "$ssh_key_state"
     else
-      health_status "admin@noc.im key" "MISS" "未授权 root"
+      health_status "root 授权公钥" "MISS" "/root/.ssh/authorized_keys 为空或不存在"
     fi
   else
     health_status "OpenSSH Server" "MISS" "未安装"
@@ -3216,13 +3362,11 @@ health_check() {
 }
 
 ensure_required_groups_fixed() {
-  local -a groups=(admin sharevip primevip coursevip labvip)
-  local -a gids=(110 30002 30003 30004 30005)
   local i group gid existing_gid used_by
 
-  for i in "${!groups[@]}"; do
-    group="${groups[$i]}"
-    gid="${gids[$i]}"
+  for i in "${!BIOINFO_GROUPS[@]}"; do
+    group="${BIOINFO_GROUPS[$i]}"
+    gid="${BIOINFO_GIDS[$i]}"
     if getent group "$group" >/dev/null 2>&1; then
       existing_gid="$(getent group "$group" | cut -d: -f3)"
       [[ "$existing_gid" == "$gid" ]] || {
@@ -3235,6 +3379,7 @@ ensure_required_groups_fixed() {
       as_root groupadd -g "$gid" "$group"
     fi
   done
+  warn_legacy_admin_group
   log "固定用户组检查完成。"
 }
 
@@ -3285,7 +3430,7 @@ one_click_bootstrap() {
   fi
 
   printf '\nConda/Mamba 开局安装：\n'
-  printf '1) 给 root 安装 micromamba（自动安装 Miniconda 前置，推荐）\n'
+  printf '1) 给 root 安装 micromamba（推荐）\n'
   printf '2) Miniforge/Mamba\n'
   printf '3) 跳过\n'
   read -r -p "选择 [1]: " conda_choice
@@ -3303,7 +3448,7 @@ one_click_bootstrap() {
     *) warn "无效选择，跳过 Conda/Mamba。" ;;
   esac
 
-  if confirm "现在配置 root SSH 公钥登录？" "Y"; then
+  if confirm "现在配置 root SSH 公钥登录？（需要提供你自己的公钥）"; then
     CURRENT_ACTION="bootstrap root ssh"
     configure_root_ssh_key_login
   fi
@@ -3316,12 +3461,12 @@ one_click_bootstrap() {
 one_click_add_user() {
   LAST_CREATED_USER=""
   CURRENT_ACTION="one-click groups"
-  ensure_required_groups_fixed || return 1
+  ensure_required_groups_fixed
   CURRENT_ACTION="one-click create user"
-  create_user || return 1
+  create_user
 
   [[ -n "$LAST_CREATED_USER" ]] || { warn "没有新用户被创建。"; return 0; }
-  if confirm "现在为新用户 $LAST_CREATED_USER 安装 micromamba？（Miniconda 自动作为前置）" "Y"; then
+  if confirm "现在为新用户 $LAST_CREATED_USER 安装 micromamba？" "Y"; then
     CURRENT_ACTION="one-click user micromamba"
     install_micromamba_for_account "$LAST_CREATED_USER"
   fi
@@ -3339,8 +3484,8 @@ show_menu() {
   printf ' 生信服务器开局助手  %s\n' "$mode_label"
   printf '============================================================\n'
   printf ' 1) 一键服务器开局（R 默认 latest/release，可指定版本）\n'
-  printf ' 2) 一键新增用户（可同时安装 micromamba，自动 Miniconda 前置）\n'
-  printf ' 3) 给 root / 普通用户安装 micromamba（自动安装 Miniconda 前置）\n'
+  printf ' 2) 一键新增用户（可同时安装 micromamba）\n'
+  printf ' 3) 给 root / 普通用户安装 micromamba\n'
   printf ' 4) 创建生信环境（RNASeq/ChIPSeq/WGS/scRNASeq/metaWRAP/MetaCAT）\n'
   printf ' 5) metaWRAP 数据库管理（root 缓存 / 普通用户本地复制）\n'
   printf ' 6) MetaCAT 数据库管理（CheckM2 / GTDB-Tk R232）\n'
@@ -3366,6 +3511,7 @@ show_menu() {
 
 main() {
   require_ubuntu
+  init_work_tmp
   init_logging
   if (( DRY_RUN )); then
     warn "当前为 --dry-run，仅打印高风险/修改命令，不应修改系统。"
@@ -3374,29 +3520,29 @@ main() {
   local choice
   while true; do
     show_menu
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || exit 0
     case "$choice" in
-      1) CURRENT_ACTION="one-click bootstrap"; one_click_bootstrap; pause ;;
-      2) CURRENT_ACTION="one-click add user"; one_click_add_user; pause ;;
-      3) CURRENT_ACTION="account micromamba"; install_micromamba_account_menu; pause ;;
-      4) CURRENT_ACTION="bioinfo envs"; create_bioinfo_envs; pause ;;
-      5) CURRENT_ACTION="metaWRAP databases"; manage_metawrap_databases; pause ;;
-      6) CURRENT_ACTION="MetaCAT databases"; manage_metacat_databases; pause ;;
-      10) CURRENT_ACTION="preflight"; preflight; pause ;;
-      11) CURRENT_ACTION="time"; configure_time; pause ;;
-      12) CURRENT_ACTION="base packages"; install_base_packages; pause ;;
-      13) CURRENT_ACTION="storage"; storage_wizard; pause ;;
-      14) CURRENT_ACTION="firewall"; configure_firewall; pause ;;
-      15) CURRENT_ACTION="dev tools"; install_dev_tools; pause ;;
-      16) CURRENT_ACTION="docker"; install_docker; pause ;;
-      17) CURRENT_ACTION="R manager"; install_r; pause ;;
-      18) CURRENT_ACTION="RStudio Server"; install_rstudio; pause ;;
-      19) CURRENT_ACTION="Miniforge"; install_miniforge; pause ;;
-      20) CURRENT_ACTION="condarc"; configure_tuna_conda_mirrors; pause ;;
-      21) CURRENT_ACTION="groups"; init_groups; pause ;;
-      22) CURRENT_ACTION="create user"; create_user; pause ;;
-      23) CURRENT_ACTION="health check"; health_check; pause ;;
-      24) CURRENT_ACTION="root ssh key"; configure_root_ssh_key_login; pause ;;
+      1) run_action "one-click bootstrap" one_click_bootstrap; pause ;;
+      2) run_action "one-click add user" one_click_add_user; pause ;;
+      3) run_action "account micromamba" install_micromamba_account_menu; pause ;;
+      4) run_action "bioinfo envs" create_bioinfo_envs; pause ;;
+      5) run_action "metaWRAP databases" manage_metawrap_databases; pause ;;
+      6) run_action "MetaCAT databases" manage_metacat_databases; pause ;;
+      10) run_action "preflight" preflight; pause ;;
+      11) run_action "time" configure_time; pause ;;
+      12) run_action "base packages" install_base_packages; pause ;;
+      13) run_action "storage" storage_wizard; pause ;;
+      14) run_action "firewall" configure_firewall; pause ;;
+      15) run_action "dev tools" install_dev_tools; pause ;;
+      16) run_action "docker" install_docker; pause ;;
+      17) run_action "R manager" install_r ;;
+      18) run_action "RStudio Server" install_rstudio; pause ;;
+      19) run_action "Miniforge" install_miniforge; pause ;;
+      20) run_action "condarc" configure_tuna_conda_mirrors; pause ;;
+      21) run_action "groups" init_groups; pause ;;
+      22) run_action "create user" create_user; pause ;;
+      23) run_action "health check" health_check; pause ;;
+      24) run_action "root ssh key" configure_root_ssh_key_login; pause ;;
       0) exit 0 ;;
       *) warn "无效选择: $choice"; sleep 1 ;;
     esac
