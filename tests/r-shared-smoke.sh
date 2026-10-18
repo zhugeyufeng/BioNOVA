@@ -12,6 +12,21 @@ if [[ ! -f /.dockerenv && -z "${CI:-}" ]]; then
 fi
 (( EUID == 0 )) || { echo "must run as root" >&2; exit 2; }
 
+# 失败时把最近日志中的关键行输出为 GitHub Actions 注释，无需登录即可从 API 看到失败原因。
+CURRENT_STEP="setup"
+report_failure() {
+  local rc=$? log
+  (( rc != 0 )) || return 0
+  log="$(find /tmp -maxdepth 1 -name 'r-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk 'NR==1 {print $2}')"
+  echo "::error title=r-shared-smoke::step '$CURRENT_STEP' failed (rc=$rc), last log: ${log:-none}"
+  if [[ -n "$log" ]]; then
+    grep -E '\[x\]|\[!\]|ERROR|Error|错误|失败|未能|不合法|不正确|leaked' "$log" | tail -8 | sed -e "s/${TEST_GITHUB_PAT:-@@none@@}/***/g" \
+      | while IFS= read -r l; do echo "::error title=r-shared-smoke log::$l"; done
+  fi
+}
+trap report_failure EXIT
+step() { CURRENT_STEP="$1"; echo "== $1"; }
+
 bionova() {
   if [[ "$TARGET" == *.sh ]]; then bash "$TARGET" "$@"; else "$TARGET" "$@"; fi
 }
@@ -34,10 +49,10 @@ lib="$root/$ver"
 renviron="$(R RHOME)/etc/Renviron.site"
 user_paths() { runuser -u tester -- Rscript -e 'cat(.libPaths(), sep = "\n")'; }
 before="$(user_paths)"
-echo "== R $ver, tester .libPaths() before:"
+step "R $ver, tester .libPaths() before:"
 printf '%s\n' "$before"
 
-echo "== dry-run status does not modify anything"
+step "dry-run status does not modify anything"
 printf '17\n9\n\n0\n0\n' | bionova --dry-run > /tmp/r-dry.log 2>&1
 expect_no_failed_action /tmp/r-dry.log
 grep -q '未配置共享库' /tmp/r-dry.log
@@ -46,18 +61,18 @@ if grep -q 'bioinfo-setup shared R library' "$renviron" 2>/dev/null; then
   exit 1
 fi
 
-echo "== R menu 8: configure on demand, install BiocManager, verify as tester"
+step "R menu 8: configure on demand, install BiocManager, verify as tester"
 printf '17\n8\ny\n%s\n3\nBiocManager\n%s\n\nn\ny\ntester\n0\n0\n' "$root" "${TEST_CRAN_MIRROR:-}" | bionova 2>&1 | tee /tmp/r-install.log
 expect_no_failed_action /tmp/r-install.log
 
-echo "== Renviron.site block"
+step "Renviron.site block"
 sed -n '/bioinfo-setup shared R library >>>/,/bioinfo-setup shared R library <<</p' "$renviron"
 test "$(stat -c '%U %a' "$lib")" = "root 755"
 test -f "$lib/BiocManager/DESCRIPTION"
 test "$(stat -c '%a' "$lib/BiocManager/DESCRIPTION")" = "644"
 
 after="$(user_paths)"
-echo "== tester .libPaths() after:"
+step "tester .libPaths() after:"
 printf '%s\n' "$after"
 grep -qx "$lib" <<<"$after"
 # 原有的站点库与基础库全部保留
@@ -69,13 +84,13 @@ awk -v lib="$lib" -v base="$(R RHOME)/library" '
   $0 == lib { l = NR } $0 == base { b = NR } END { exit !(l && b && l < b) }' <<<"$after"
 runuser -u tester -- Rscript -e 'stopifnot(dirname(system.file(package = "BiocManager")) == commandArgs(TRUE)[1])' "$lib"
 
-echo "== configure again is idempotent"
+step "configure again is idempotent"
 printf '17\n7\n%s\na\n0\n0\n' "$root" | bionova > /tmp/r-reconf.log 2>&1
 expect_no_failed_action /tmp/r-reconf.log
 test "$(grep -c 'bioinfo-setup shared R library >>>' "$renviron")" -eq 1
 test "$(user_paths)" = "$after"
 
-echo "== GitHub package (r-lib/crayon) into the shared library"
+step "GitHub package (r-lib/crayon) into the shared library"
 # 流程：自定义 → 作者/仓库 → token（CI 传入，可为空）→ 镜像留空 → 不装系统依赖 → 确认 → tester 验证
 printf '17\n8\n3\nr-lib/crayon\n%s\n%s\n\nn\ny\ntester\n0\n0\n' "${TEST_GITHUB_PAT:-}" "${TEST_CRAN_MIRROR:-}" | bionova 2>&1 | tee /tmp/r-github.log
 expect_no_failed_action /tmp/r-github.log
@@ -88,17 +103,17 @@ if [[ -n "${TEST_GITHUB_PAT:-}" ]] && grep -rqF "$TEST_GITHUB_PAT" /tmp/r-github
   exit 1
 fi
 
-echo "== invalid GitHub spec is rejected"
+step "invalid GitHub spec is rejected"
 printf '17\n8\n3\na/../b\n0\n0\n' | bionova > /tmp/r-badspec.log 2>&1
 grep -q '包名格式不合法' /tmp/r-badspec.log
 
-echo "== status shows the library and verifies as tester"
+step "status shows the library and verifies as tester"
 printf '17\n9\ntester\nBiocManager\n0\n0\n' | bionova 2>&1 | tee /tmp/r-status.log
 expect_no_failed_action /tmp/r-status.log
 grep -q "已安装 [1-9][0-9]* 个包" /tmp/r-status.log
 grep -Eq 'BiocManager +OK' /tmp/r-status.log
 
-echo "== health check reports the shared library"
+step "health check reports the shared library"
 printf '23\n\n0\n' | bionova 2>&1 | grep '共享 R 包库' | tee /tmp/r-health.log
 grep -q "OK.*$lib" /tmp/r-health.log
 

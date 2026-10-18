@@ -1267,7 +1267,8 @@ install_r_shared_packages() {
     read -r -s -p "GitHub token（可选，避免匿名 API 每小时 60 次的限流；留空跳过）: " github_pat
     printf '\n'
     if [[ -n "$github_pat" ]]; then
-      [[ "$github_pat" =~ ^[A-Za-z0-9_]+$ ]] || { warn "GitHub token 格式不正确。"; return 1; }
+      # token 只写入文件、不拼接进命令，因此只需排除空白和控制字符（各类 token 格式字符集不同）。
+      [[ "$github_pat" =~ ^[[:graph:]]+$ ]] || { warn "GitHub token 格式不正确。"; return 1; }
       pat_file="$(mktemp "$WORK_TMP/github-pat.XXXXXX")"
       chmod 0600 "$pat_file"
       printf '%s\n' "$github_pat" > "$pat_file"
