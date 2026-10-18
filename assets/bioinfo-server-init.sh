@@ -44,6 +44,25 @@ METACAT_WHEEL_LOCAL=""
 # 固定用户组与 GID。不使用 admin：Ubuntu 默认 sudoers 含 "%admin ALL=(ALL) ALL"。
 BIOINFO_GROUPS=(bioadmin sharevip primevip coursevip labvip)
 BIOINFO_GIDS=(30001 30002 30003 30004 30005)
+# 共享 R 包库：<根目录>/<R 主.次版本>，通过各 R 的 Renviron.site 加入 R_LIBS_SITE。
+R_SHARED_LIB_ROOT_DEFAULT="$DATA_MOUNT_DEFAULT/R_Lib"
+R_SHARED_BLOCK_BEGIN="# >>> bioinfo-setup shared R library >>>"
+R_SHARED_BLOCK_END="# <<< bioinfo-setup shared R library <<<"
+R_SHARED_PKGS_ENRICH=(BiocManager clusterProfiler enrichplot DOSE AnnotationDbi org.Hs.eg.db org.Mm.eg.db org.Dr.eg.db)
+R_SHARED_PKGS_COMMON=(
+  BiocManager tidyverse devtools Seurat SeuratObject harmony patchwork
+  DESeq2 edgeR DiffBind BSgenome clusterProfiler GSVA pheatmap ComplexHeatmap
+  SingleCellExperiment HDF5Array limma S4Vectors SingleR TCGAbiolinks
+)
+R_BUILD_DEPS=(
+  build-essential gfortran cmake pkg-config
+  libcurl4-openssl-dev libssl-dev libxml2-dev libgit2-dev
+  libfontconfig1-dev libfreetype6-dev libpng-dev libtiff-dev libjpeg-dev
+  libharfbuzz-dev libfribidi-dev libglpk-dev libhdf5-dev libgsl-dev
+  zlib1g-dev libbz2-dev liblzma-dev
+)
+SELECTED_R_HOME=""
+R_SHARED_LIB_LAST=""
 LOG_DIR="/var/log/bioinfo-setup"
 LOG_FILE=""
 CURRENT_ACTION="startup"
@@ -981,21 +1000,357 @@ sync_rstudio_r_path() {
   fi
 }
 
-install_common_r_packages() {
-  local data_mount lib_dir r_mm
-  command -v Rscript >/dev/null 2>&1 || { warn "当前没有默认 Rscript。"; return 1; }
+# ---------------------------------------------------------------- 共享 R 包库
+# 管理员把包安装到 <根目录>/<主.次版本>（root 所有、0755，普通用户只读），并在每个 R 安装的
+# R_HOME/etc/Renviron.site 中把该目录加入 R_LIBS_SITE。R_LIBS_SITE 排在用户个人库之后：
+# 所有用户（含 RStudio Server 会话）自动可见，用户自行安装的新版本仍然优先。
+# 每个 R 主.次版本使用独立目录，rig 多版本并存时不会把旧版本编译的包加载进新 R。
 
-  read -r -p "共享 R library 根目录 [$DATA_MOUNT_DEFAULT/R_Lib]: " data_mount
-  [[ -n "$data_mount" ]] || data_mount="$DATA_MOUNT_DEFAULT/R_Lib"
+# 本机所有 R 安装的 R_HOME：rig 安装在 /opt/R/<版本>/lib/R，apt 安装在 /usr/lib/R，再加上当前默认 R。
+list_r_homes() {
+  local h
+  local -a homes=()
+  for h in /opt/R/*/lib/R /usr/lib/R; do
+    [[ -x "$h/bin/Rscript" ]] && homes+=("$(readlink -f "$h")")
+  done
+  h="$(r_default_home || true)"
+  [[ -n "$h" ]] && homes+=("$h")
+  (( ${#homes[@]} > 0 )) || return 0
+  printf '%s\n' "${homes[@]}" | awk 'NF && !seen[$0]++'
+}
 
-  r_mm="$(Rscript -e 'cat(paste(R.version$major, strsplit(R.version$minor, "\\.")[[1]][1], sep="."))')"
-  lib_dir="$data_mount/$r_mm"
-  as_root mkdir -p "$lib_dir"
+r_default_home() {
+  local h
+  command -v R >/dev/null 2>&1 || return 1
+  h="$(R RHOME 2>/dev/null || true)"
+  [[ -n "$h" && -x "$h/bin/Rscript" ]] || return 1
+  readlink -f "$h"
+}
 
-  local r_expr
-  r_expr=".libPaths(c('$lib_dir', .libPaths())); options(repos=c(CRAN='https://cloud.r-project.org')); install.packages(c('BiocManager','tidyverse','devtools','Seurat','SeuratObject','harmony','patchwork'), lib='$lib_dir'); BiocManager::install(c('DESeq2','edgeR','DiffBind','BSgenome','clusterProfiler','GSVA','pheatmap','ComplexHeatmap','SingleCellExperiment','HDF5Array','limma','S4Vectors','SingleR','TCGAbiolinks'), lib='$lib_dir', ask=FALSE, update=FALSE)"
-  as_root Rscript -e "$r_expr"
-  log "常用 R/Bioconductor 包已安装到 $lib_dir"
+r_home_minor_version() {
+  "$1/bin/Rscript" --vanilla -e 'cat(R.version$major, strsplit(R.version$minor, ".", fixed = TRUE)[[1]][1], sep = ".")' 2>/dev/null
+}
+
+# RStudio Server 实际使用的 R_HOME（rserver.conf 的 rsession-which-r，未配置时为默认 R）。
+r_rstudio_home() {
+  local which_r=""
+  dpkg-query -W -f='${Status}' rstudio-server 2>/dev/null | grep -Fq 'install ok installed' || return 1
+  if [[ -r /etc/rstudio/rserver.conf ]]; then
+    which_r="$(awk -F= '/^rsession-which-r=/ {print $2; exit}' /etc/rstudio/rserver.conf)"
+  fi
+  if [[ -z "$which_r" ]]; then
+    r_default_home
+    return
+  fi
+  [[ -x "$which_r" ]] || return 1
+  readlink -f "$("$which_r" RHOME 2>/dev/null)"
+}
+
+# 读取某个 R 已配置的共享包目录（Renviron.site 中由本脚本管理的区块）。
+r_shared_lib_for_home() {
+  local file="$1/etc/Renviron.site"
+  [[ -r "$file" ]] || return 1
+  awk -v b="$R_SHARED_BLOCK_BEGIN" -v e="$R_SHARED_BLOCK_END" '
+    $0 == b { inblock = 1; next }
+    $0 == e { inblock = 0; next }
+    inblock && /^R_LIBS_SITE=/ { sub(/^R_LIBS_SITE=/, ""); sub(/:.*/, ""); print; found = 1; exit }
+    END { exit !found }' "$file"
+}
+
+r_home_label() {
+  local h="$1" ver tags="" lib
+  ver="$(r_home_minor_version "$h" || true)"
+  [[ "$h" == "$(r_default_home || true)" ]] && tags+=" [默认]"
+  [[ "$h" == "$(r_rstudio_home || true)" ]] && tags+=" [RStudio]"
+  if lib="$(r_shared_lib_for_home "$h")"; then
+    tags+=" [共享库: $lib]"
+  else
+    tags+=" [未配置共享库]"
+  fi
+  printf 'R %-5s %s%s' "${ver:-?}" "$h" "$tags"
+}
+
+# 交互选择一个 R 安装，结果写入 SELECTED_R_HOME。只有一个时直接选中。
+select_r_home() {
+  local -a homes=()
+  local default_home choice i default_index=1
+  mapfile -t homes < <(list_r_homes)
+  (( ${#homes[@]} > 0 )) || { warn "未检测到已安装的 R，请先在 R 菜单中通过 rig 安装 R。"; return 1; }
+  if (( ${#homes[@]} == 1 )); then
+    SELECTED_R_HOME="${homes[0]}"
+    info "使用 $(r_home_label "$SELECTED_R_HOME")"
+    return 0
+  fi
+
+  default_home="$(r_default_home || true)"
+  printf '\n已安装的 R：\n'
+  for i in "${!homes[@]}"; do
+    printf '%2d) %s\n' "$((i + 1))" "$(r_home_label "${homes[$i]}")"
+    [[ "${homes[$i]}" == "$default_home" ]] && default_index=$((i + 1))
+  done
+  read -r -p "选择 R [$default_index]: " choice
+  choice="${choice:-$default_index}"
+  if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#homes[@]} )); then
+    warn "无效选择: $choice"
+    return 1
+  fi
+  SELECTED_R_HOME="${homes[$((choice - 1))]}"
+}
+
+read_r_shared_lib_root() {
+  local root
+  read -r -p "共享 R 包根目录（每个 R 主.次版本一个子目录）[$R_SHARED_LIB_ROOT_DEFAULT]: " root
+  root="${root:-$R_SHARED_LIB_ROOT_DEFAULT}"
+  # 路径会写入以冒号分隔的 R_LIBS_SITE，不允许空格、冒号等特殊字符。
+  [[ "$root" =~ ^/[A-Za-z0-9._/+-]+$ ]] || { warn "根目录必须是不含空格和冒号的绝对路径: $root"; return 1; }
+  if [[ "$root" == "$DATA_MOUNT_DEFAULT"/* ]] && ! mountpoint -q "$DATA_MOUNT_DEFAULT"; then
+    warn "$DATA_MOUNT_DEFAULT 当前不是独立挂载点；稍后挂载数据盘会遮住在根分区上创建的共享目录。"
+    if (( DRY_RUN == 0 )) && ! confirm "仍然使用 $root？"; then
+      return 1
+    fi
+  fi
+  printf '%s' "$root"
+}
+
+# 把共享目录写入 R_HOME/etc/Renviron.site 中由本脚本管理的区块，保留文件中其他内容。
+write_r_shared_renviron() {
+  local r_home="$1" lib="$2" file existing="" content
+  file="$r_home/etc/Renviron.site"
+  # ${R_LIBS_SITE-...} 保留 R 自带或其他配置设置的站点库；变量未设置时回退到 R_HOME/site-library。
+  content="$R_SHARED_BLOCK_BEGIN
+# 管理员安装的共享 R 包目录；排在用户个人库之后，用户自行安装的版本优先。
+R_LIBS_SITE=$lib:\${R_LIBS_SITE-$r_home/site-library}
+$R_SHARED_BLOCK_END"
+
+  if [[ -f "$file" ]]; then
+    backup_file "$file"
+    existing="$(awk -v b="$R_SHARED_BLOCK_BEGIN" -v e="$R_SHARED_BLOCK_END" '
+      $0 == b { skip = 1; next }
+      $0 == e { skip = 0; next }
+      !skip' "$file")"
+    if grep -Eq '^[[:space:]]*R_LIBS_SITE=' <<<"$existing"; then
+      warn "$file 中已有其他 R_LIBS_SITE 设置；共享目录追加在其后并保留原有路径。"
+    fi
+  fi
+  [[ -z "$existing" ]] || content="$existing"$'\n'"$content"
+
+  write_root_file "$file" "$content"
+  as_root chmod 0644 "$file"
+}
+
+configure_r_shared_library_for_home() {
+  local r_home="$1" root="$2" ver lib
+  ver="$(r_home_minor_version "$r_home")" || { warn "无法读取 $r_home 的 R 版本。"; return 1; }
+  [[ -n "$ver" ]] || { warn "无法读取 $r_home 的 R 版本。"; return 1; }
+  lib="$root/$ver"
+
+  as_root install -d -m 0755 -o root -g root "$root" "$lib"
+  write_r_shared_renviron "$r_home" "$lib"
+  R_SHARED_LIB_LAST="$lib"
+  log "R $ver ($r_home) 共享包目录: $lib"
+}
+
+warn_if_rstudio_r_unconfigured() {
+  local rs_home
+  rs_home="$(r_rstudio_home || true)"
+  [[ -n "$rs_home" ]] || return 0
+  if r_shared_lib_for_home "$rs_home" >/dev/null || (( DRY_RUN )); then
+    info "RStudio Server 使用的 R: $rs_home。已打开的会话需要 Session → Restart R 后生效。"
+  else
+    warn "RStudio Server 使用的 R ($rs_home) 尚未配置共享库，RStudio 用户将看不到共享包。"
+  fi
+}
+
+configure_r_shared_library() {
+  local root choice h i
+  local -a homes=() targets=()
+  mapfile -t homes < <(list_r_homes)
+  (( ${#homes[@]} > 0 )) || { warn "未检测到已安装的 R，请先在 R 菜单中通过 rig 安装 R。"; return 1; }
+
+  root="$(read_r_shared_lib_root)"
+
+  printf '\n已安装的 R：\n'
+  for i in "${!homes[@]}"; do
+    printf '%2d) %s\n' "$((i + 1))" "$(r_home_label "${homes[$i]}")"
+  done
+  printf ' a) 全部\n'
+  read -r -p "选择要配置的 R [a]: " choice
+  choice="${choice:-a}"
+  if [[ "$choice" == "a" ]]; then
+    targets=("${homes[@]}")
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#homes[@]} )); then
+    targets=("${homes[$((choice - 1))]}")
+  else
+    warn "无效选择: $choice"
+    return 1
+  fi
+
+  for h in "${targets[@]}"; do
+    configure_r_shared_library_for_home "$h" "$root"
+  done
+  warn_if_rstudio_r_unconfigured
+  info "之后用 R 菜单「管理员安装共享 R 包」安装的包对所有普通用户可见。"
+}
+
+# 以普通用户身份加载包，确认共享库对其可见；打印每个包实际所在的库目录。
+verify_r_packages_as_user() {
+  local user="$1" r_home="$2"
+  shift 2
+  local code='pkgs <- commandArgs(TRUE); ok <- TRUE
+for (p in pkgs) {
+  loaded <- suppressWarnings(suppressPackageStartupMessages(requireNamespace(p, quietly = TRUE)))
+  where <- if (loaded) dirname(system.file(package = p)) else "-"
+  cat(sprintf("  %-24s %-5s %s\n", p, if (loaded) "OK" else "FAIL", where))
+  ok <- ok && loaded
+}
+cat("  .libPaths():\n"); cat(paste0("    ", .libPaths()), sep = "\n")
+if (!ok) quit(status = 1)'
+  info "以用户 $user 身份验证（R_HOME=$r_home）："
+  as_named_user "$user" "$r_home/bin/Rscript" -e "$code" "$@"
+}
+
+default_r_verify_user() {
+  local user
+  user="$(login_user)"
+  if [[ "$user" != "root" ]]; then
+    printf '%s' "$user"
+    return 0
+  fi
+  getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ {print $1; exit}'
+}
+
+install_r_shared_packages() {
+  local r_home ver lib root choice cran bioc verify_user pkg script
+  local -a pkgs=()
+
+  select_r_home
+  r_home="$SELECTED_R_HOME"
+  ver="$(r_home_minor_version "$r_home")"
+
+  if ! lib="$(r_shared_lib_for_home "$r_home")"; then
+    warn "R $ver 尚未配置共享包目录。"
+    confirm "现在为 R $ver 配置共享包目录？" "Y" || return 0
+    root="$(read_r_shared_lib_root)"
+    configure_r_shared_library_for_home "$r_home" "$root"
+    lib="$R_SHARED_LIB_LAST"
+  fi
+
+  printf '\n共享 R 包组合：\n'
+  printf '1) GO/KEGG 富集分析：%s\n' "${R_SHARED_PKGS_ENRICH[*]}"
+  printf '2) 常用分析包：%s\n' "${R_SHARED_PKGS_COMMON[*]}"
+  printf '3) 自定义包名（CRAN / Bioconductor，空格分隔）\n'
+  read -r -p "选择 [1]: " choice
+  case "${choice:-1}" in
+    1) pkgs=("${R_SHARED_PKGS_ENRICH[@]}") ;;
+    2) pkgs=("${R_SHARED_PKGS_COMMON[@]}") ;;
+    3) read -r -a pkgs -p "包名: " ;;
+    *) warn "无效选择: $choice"; return 1 ;;
+  esac
+  (( ${#pkgs[@]} > 0 )) || { warn "没有输入包名。"; return 1; }
+  for pkg in "${pkgs[@]}"; do
+    [[ "$pkg" =~ ^[A-Za-z][A-Za-z0-9.]*[A-Za-z0-9]$ ]] || { warn "包名格式不合法: $pkg"; return 1; }
+  done
+
+  read -r -p "CRAN 镜像（留空保持该 R 当前的 repos 配置）: " cran
+  read -r -p "Bioconductor 镜像（留空使用官方，例如 https://mirrors.tuna.tsinghua.edu.cn/bioconductor）: " bioc
+  for choice in "$cran" "$bioc"; do
+    [[ -z "$choice" || "$choice" =~ ^https?://[^[:space:]]+$ ]] || { warn "镜像地址格式不合法: $choice"; return 1; }
+  done
+
+  if confirm "安装编译 R 包常用的系统依赖（libxml2、libcurl、libglpk、HDF5 等）？" "Y"; then
+    as_root apt-get update
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "${R_BUILD_DEPS[@]}"
+  fi
+
+  printf '\n共享包安装确认：\n'
+  printf '  R:       %s (%s)\n' "$ver" "$r_home"
+  printf '  共享库:  %s\n' "$lib"
+  printf '  包:      %s\n' "${pkgs[*]}"
+  printf '  CRAN:    %s\n' "${cran:-保持当前配置}"
+  printf '  Bioc:    %s\n' "${bioc:-官方}"
+  confirm "确认以管理员身份安装到共享库？" || { warn "已取消。"; return 0; }
+
+  script="$WORK_TMP/install-shared-r-packages.R"
+  cat > "$script" <<'RSCRIPT'
+args <- commandArgs(trailingOnly = TRUE)
+lib <- args[[1]]
+pkgs <- unique(args[-1])
+.libPaths(c(lib, .libPaths()))
+
+repos <- getOption("repos")
+if (is.null(repos)) repos <- c(CRAN = "@CRAN@")
+cran <- Sys.getenv("BIOINFO_CRAN_MIRROR")
+if (nzchar(cran)) repos[["CRAN"]] <- cran
+if (is.na(repos["CRAN"]) || repos[["CRAN"]] %in% c("", "@CRAN@")) repos[["CRAN"]] <- "https://cloud.r-project.org"
+options(repos = repos)
+bioc <- Sys.getenv("BIOINFO_BIOC_MIRROR")
+if (nzchar(bioc)) options(BioC_mirror = bioc)
+options(Ncpus = max(1L, parallel::detectCores() - 1L))
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", lib = lib)
+# update = FALSE：不顺带升级 Matrix、MASS 等已有包，避免影响其他用户的分析结果。
+BiocManager::install(pkgs, lib = lib, ask = FALSE, update = FALSE)
+
+missing <- pkgs[!vapply(pkgs, function(p) nzchar(system.file(package = p)), logical(1))]
+if (length(missing)) {
+  message("以下包未能安装: ", paste(missing, collapse = ", "))
+  message("请检查包名拼写（例如人类注释包是 org.Hs.eg.db，不是 org.Hm.eg.db），以及上方日志中最早出现的 ERROR。")
+  quit(status = 1)
+}
+message("共享库: ", lib)
+message("Bioconductor ", as.character(BiocManager::version()), " / ", R.version.string)
+RSCRIPT
+
+  # R_LIBS_USER 指向不存在的目录：root 个人库中已有的包不会让 BiocManager 跳过安装
+  # （否则普通用户看不到）；umask 022 保证安装出的文件对所有用户可读。
+  as_root env R_LIBS_USER=/nonexistent/bioinfo-setup R_LIBS= \
+    BIOINFO_CRAN_MIRROR="$cran" BIOINFO_BIOC_MIRROR="$bioc" \
+    bash -c 'umask 022; exec "$@"' _ "$r_home/bin/Rscript" "$script" "$lib" "${pkgs[@]}"
+  log "共享 R 包已安装到 $lib"
+
+  verify_user="$(default_r_verify_user || true)"
+  read -r -p "用于验证的普通用户名（留空跳过）[${verify_user:-无}]: " choice
+  verify_user="${choice:-$verify_user}"
+  if [[ -n "$verify_user" ]]; then
+    id "$verify_user" >/dev/null 2>&1 || { warn "用户 $verify_user 不存在。"; return 1; }
+    if ! verify_r_packages_as_user "$verify_user" "$r_home" "${pkgs[@]}"; then
+      warn "用户 $verify_user 无法加载部分共享包；请检查上面的 .libPaths() 是否包含 $lib。"
+      return 1
+    fi
+  fi
+  warn_if_rstudio_r_unconfigured
+}
+
+show_r_shared_status() {
+  local -a homes=()
+  local h lib count perm user pkgs_text default_home
+  local -a pkgs=()
+  mapfile -t homes < <(list_r_homes)
+  (( ${#homes[@]} > 0 )) || { warn "未检测到已安装的 R，请先在 R 菜单中通过 rig 安装 R。"; return 1; }
+
+  printf '\n=== 共享 R 包目录 ===\n'
+  for h in "${homes[@]}"; do
+    printf '%s\n' "$(r_home_label "$h")"
+    if lib="$(r_shared_lib_for_home "$h")"; then
+      if [[ -d "$lib" ]]; then
+        count="$(find "$lib" -mindepth 2 -maxdepth 2 -name DESCRIPTION 2>/dev/null | wc -l)"
+        perm="$(stat -c '%U:%G %a' "$lib")"
+        printf '    目录 %s（%s），已安装 %s 个包\n' "$lib" "$perm" "$count"
+      else
+        printf '    目录 %s 不存在\n' "$lib"
+      fi
+    fi
+  done
+  warn_if_rstudio_r_unconfigured
+
+  default_home="$(r_default_home || true)"
+  [[ -n "$default_home" ]] || return 0
+  read -r -p "用普通用户验证默认 R 的共享包可见性（输入用户名，留空跳过）: " user
+  [[ -n "$user" ]] || return 0
+  id "$user" >/dev/null 2>&1 || { warn "用户 $user 不存在。"; return 1; }
+  read -r -p "要验证的包（空格分隔）[BiocManager]: " pkgs_text
+  read -r -a pkgs <<<"${pkgs_text:-BiocManager}"
+  verify_r_packages_as_user "$user" "$default_home" "${pkgs[@]}"
 }
 
 install_r_for_bootstrap() {
@@ -1039,6 +1394,10 @@ r_add_version() {
     as_root rig default "$target"
     sync_rstudio_r_path
   fi
+  # 新版本的 R 有自己的 Renviron.site，需要单独加入共享包目录（每个主.次版本一个目录）。
+  if confirm "为新安装的 R 配置全体用户共享包目录？" "Y"; then
+    configure_r_shared_library
+  fi
 }
 
 r_set_default() {
@@ -1076,7 +1435,9 @@ install_r() {
     printf '4) 安装指定 R 版本 / 别名\n'
     printf '5) 切换默认 R 版本\n'
     printf '6) 删除指定 R 版本\n'
-    printf '7) 安装当前默认 R 的常用 CRAN/Bioconductor 包\n'
+    printf '7) 配置全体用户共享 R 包目录（Renviron.site）\n'
+    printf '8) 管理员安装共享 R 包（clusterProfiler 等，所有用户可用）\n'
+    printf '9) 查看共享 R 包目录 / 验证普通用户可见性\n'
     printf '0) 返回主菜单\n'
     read -r -p "选择: " choice || return 0
 
@@ -1087,7 +1448,9 @@ install_r() {
       4) run_action "R: add version" r_add_version ;;
       5) run_action "R: set default" r_set_default ;;
       6) run_action "R: remove version" r_remove_version ;;
-      7) run_action "R: common packages" install_common_r_packages ;;
+      7) run_action "R: configure shared library" configure_r_shared_library ;;
+      8) run_action "R: install shared packages" install_r_shared_packages ;;
+      9) run_action "R: shared library status" show_r_shared_status ;;
       0)
         CURRENT_ACTION="main menu"
         return 0
@@ -2803,7 +3166,7 @@ rollback_user_creation() {
 create_user() {
   local username user_type requested_uid expected_gid primary_gid
   local home_soft home_hard data_soft data_hard expiry data_mount
-  local user_home data_dir r_ver rprofile_line home_fs data_fs actual_uid actual_gid q
+  local user_home data_dir r_ver renviron_line home_fs data_fs actual_uid actual_gid q
   local i
   local -a useradd_args=(-m -s /bin/bash)
 
@@ -2942,28 +3305,30 @@ create_user() {
     return 1
   fi
 
+  # 个人 R 库放在数据盘。R 会把 %v 展开为主.次版本号：升级 R 后自动换到新版本目录，
+  # 不会把旧版本编译的包加载进新 R。管理员共享包由各 R 的 Renviron.site 提供（R 菜单 → 共享 R 包目录）。
+  renviron_line="R_LIBS_USER=$data_dir/R_Lib_%v"
+  if (( DRY_RUN )); then
+    printf '[dry-run] append %q to %q\n' "$renviron_line" "$user_home/.Renviron"
+  else
+    as_root touch "$user_home/.Renviron"
+    if ! as_root grep -Fqx -- "$renviron_line" "$user_home/.Renviron"; then
+      if (( EUID == 0 )); then
+        printf '%s\n' "$renviron_line" >> "$user_home/.Renviron"
+      else
+        printf '%s\n' "$renviron_line" | sudo tee -a "$user_home/.Renviron" >/dev/null
+      fi
+    fi
+    as_root chown "$username:$user_type" "$user_home/.Renviron"
+  fi
   if command -v Rscript >/dev/null 2>&1; then
     r_ver="$(Rscript -e 'cat(paste(R.version$major, strsplit(R.version$minor, "\\.")[[1]][1], sep="."))' 2>/dev/null || true)"
-    if [[ -n "$r_ver" ]]; then
-      if ! as_root mkdir -p "$data_dir/R_Lib_$r_ver" "$data_mount/R_Lib/$r_ver"; then
-        rollback_user_creation "$username" "$data_dir" "$home_fs" "$data_fs"
-        return 1
-      fi
-      as_root chown "$username:$user_type" "$data_dir/R_Lib_$r_ver"
-      rprofile_line=".libPaths(c(\"$data_dir/R_Lib_$r_ver\", \"$data_mount/R_Lib/$r_ver\"))"
-      if (( DRY_RUN )); then
-        printf '[dry-run] append %q to %q\n' "$rprofile_line" "$user_home/.Rprofile"
-      else
-        as_root touch "$user_home/.Rprofile"
-        if ! as_root grep -Fqx -- "$rprofile_line" "$user_home/.Rprofile"; then
-          if (( EUID == 0 )); then
-            printf '%s\n' "$rprofile_line" >> "$user_home/.Rprofile"
-          else
-            printf '%s\n' "$rprofile_line" | sudo tee -a "$user_home/.Rprofile" >/dev/null
-          fi
-        fi
-        as_root chown "$username:$user_type" "$user_home/.Rprofile"
-      fi
+    if [[ -n "$r_ver" ]] && ! as_root install -d -m 0750 -o "$username" -g "$user_type" "$data_dir/R_Lib_$r_ver"; then
+      rollback_user_creation "$username" "$data_dir" "$home_fs" "$data_fs"
+      return 1
+    fi
+    if ! r_shared_lib_for_home "$(r_default_home || true)" >/dev/null 2>&1; then
+      warn "默认 R 尚未配置全体用户共享包目录；新用户目前只能使用个人库（R 菜单 → 配置共享 R 包目录）。"
     fi
   fi
 
@@ -3202,7 +3567,7 @@ health_status() {
 }
 
 health_check() {
-  local data_fs data_opts docker_ver r_ver rstudio_ver rstudio_state rstudio_r current_r
+  local data_fs data_opts docker_ver r_ver r_home r_shared_lib rstudio_ver rstudio_state rstudio_r current_r
   local home manager env_output group i missing_groups=0 bad_groups=0 expected_gid actual_group_gid ssh_state ssh_root ssh_pubkey ssh_key_state
 
   printf '\n============================================================\n'
@@ -3242,6 +3607,12 @@ health_check() {
   r_ver="$(R --version 2>/dev/null | head -1 || true)"
   if [[ -n "$r_ver" ]]; then
     health_status "R default" "OK" "$r_ver"
+    r_home="$(r_default_home || true)"
+    if r_shared_lib="$(r_shared_lib_for_home "$r_home")"; then
+      health_status "共享 R 包库" "OK" "$r_shared_lib"
+    else
+      health_status "共享 R 包库" "WARN" "默认 R ($r_home) 未配置，普通用户看不到管理员安装的包"
+    fi
   else
     health_status "R default" "MISS" "未安装"
   fi
@@ -3428,6 +3799,13 @@ one_click_bootstrap() {
     CURRENT_ACTION="bootstrap RStudio"
     install_rstudio
   fi
+  # 放在数据盘初始化之后：共享目录默认位于 $DATA_MOUNT_DEFAULT 下。
+  if (( DRY_RUN )) && ! r_default_home >/dev/null; then
+    info "dry-run：R 尚未实际安装，跳过共享 R 包目录配置。"
+  elif confirm "现在配置全体用户共享 R 包目录（默认 $R_SHARED_LIB_ROOT_DEFAULT/<R 版本>）？" "Y"; then
+    CURRENT_ACTION="bootstrap R shared library"
+    configure_r_shared_library
+  fi
 
   printf '\nConda/Mamba 开局安装：\n'
   printf '1) 给 root 安装 micromamba（推荐）\n'
@@ -3497,7 +3875,7 @@ show_menu() {
   printf '14) 配置 UFW 防火墙\n'
   printf '15) 安装编译 / Python / Java 开发环境\n'
   printf '16) 安装 Docker\n'
-  printf '17) R 多版本管理（rig）\n'
+  printf '17) R 多版本管理（rig）/ 全体用户共享 R 包\n'
   printf '18) 安装 / 升级 / 降级 RStudio Server\n'
   printf '19) 安装 Miniforge / Mamba\n'
   printf '20) 配置清华 Conda / Bioconda 源（无损合并）\n'

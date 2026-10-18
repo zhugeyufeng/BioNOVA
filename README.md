@@ -84,6 +84,40 @@ sudo usermod -g bioadmin <用户>
 
 程序不内置任何公钥。配置 root 公钥登录时需要粘贴你自己的公钥，或指定一个只包含一行公钥的文件；菜单默认选项是取消。健康检查会列出 root 已授权公钥的指纹，请确认均为可信公钥。
 
+## 全体用户共享 R 包
+
+管理员安装一次，所有普通用户（包括 RStudio Server 会话）直接 `library()` 使用，不用每人重复安装。入口：主菜单 17 → R 菜单 7 / 8 / 9。
+
+| R 菜单 | 作用 |
+| --- | --- |
+| 7 配置共享 R 包目录 | 为选定的（或全部）R 安装创建 `<根目录>/<R 主.次版本>`（默认 `/data_disk/R_Lib/4.6`，root 所有、0755，普通用户只读），并写入该 R 的 `R_HOME/etc/Renviron.site` |
+| 8 管理员安装共享 R 包 | 预设组合（GO/KEGG 富集：clusterProfiler、enrichplot、DOSE、AnnotationDbi、org.Hs/Mm/Dr.eg.db；常用分析包）或自定义包名，用 `BiocManager::install(lib = 共享目录, ask = FALSE, update = FALSE)` 安装，装完以指定普通用户身份逐个加载验证 |
+| 9 查看 / 验证 | 列出每个 R 的共享目录、权限、包数量，可选以普通用户身份验证可见性 |
+
+`Renviron.site` 中写入的是一个由本程序管理的区块，重复配置只会替换这个区块，不会动文件里的其他内容：
+
+~~~text
+# >>> bioinfo-setup shared R library >>>
+R_LIBS_SITE=/data_disk/R_Lib/4.6:${R_LIBS_SITE-/opt/R/4.6.1/lib/R/site-library}
+# <<< bioinfo-setup shared R library <<<
+~~~
+
+- 共享目录属于站点库，排在用户个人库之后：用户自己安装的新版本仍然优先，用户的 `install.packages()` 也只写入个人库，不会改动共享库。
+- `${R_LIBS_SITE-…}` 保留 R 原有的站点库（例如 Debian R 的 `/usr/local/lib/R/site-library`）。
+- 每个 R 主.次版本有独立目录。用 rig 安装新版本 R 后，菜单会提示为新版本配置；旧版本编译的包不会被新 R 加载。
+- 安装时 R 使用当前该 R 的 `repos` 配置（rig 默认的 Posit 二进制源会保留），也可以临时指定 CRAN 镜像和 Bioconductor 镜像（例如 `https://mirrors.tuna.tsinghua.edu.cn/bioconductor`）。Bioconductor 版本由 BiocManager 按 R 版本自动匹配。
+- 安装进程屏蔽 root 的个人库，并使用 `umask 022`：避免 root 个人库里已有同名包导致 BiocManager 跳过安装、普通用户却看不到；安装出的文件对所有用户可读。
+- 包名写错（例如把 `org.Hs.eg.db` 写成 `org.Hm.eg.db`）时，BiocManager 只给出警告；程序会在安装后逐个检查，把缺失的包列出来并判定为失败。
+- RStudio Server 读取的是 `rsession-which-r` 指向的那个 R 的 `Renviron.site`；如果它没有配置共享库，菜单会给出提示。已打开的 RStudio 会话需要 Session → Restart R 才会生效。
+
+新建用户时，个人 R 库改为写入 `~/.Renviron`：
+
+~~~text
+R_LIBS_USER=/data_disk/user/<用户>/R_Lib_%v
+~~~
+
+R 会把 `%v` 展开为主.次版本号，升级 R 后自动使用新版本目录。旧版本创建的用户在 `~/.Rprofile` 中写死了 `R_Lib_<版本>` 路径，升级 R 主.次版本前建议删除这行，改为上面的 `~/.Renviron` 写法。
+
 ## Conda 环境
 
 - micromamba 是独立可执行文件，从 `mamba-org/micromamba-releases` 官方 Release 下载，并按 GitHub 提供的 sha256 digest 校验；不再安装 Miniconda 作为“前置”。
