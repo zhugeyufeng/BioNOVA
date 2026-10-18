@@ -103,6 +103,24 @@ if [[ -n "${TEST_GITHUB_PAT:-}" ]] && grep -rqF "$TEST_GITHUB_PAT" /tmp/r-github
   exit 1
 fi
 
+step "list shared packages with version and source"
+printf '17\n10\n\n0\n0\n' | bionova > /tmp/r-list.log 2>&1
+expect_no_failed_action /tmp/r-list.log
+grep -E '^  (BiocManager|crayon|remotes) ' /tmp/r-list.log
+grep -Eq '^  BiocManager +[0-9.]+ +[0-9.]+ +CRAN$' /tmp/r-list.log
+grep -Eq '^  crayon +[0-9.]+ +[0-9.]+ +GitHub r-lib/crayon@[0-9a-f]{7}$' /tmp/r-list.log
+grep -Eq '共 [0-9]+ 个包：.*GitHub 1' /tmp/r-list.log
+
+step "list shared packages filtered by keyword"
+printf '17\n10\nCRAY\n0\n0\n' | bionova > /tmp/r-list-filter.log 2>&1
+expect_no_failed_action /tmp/r-list-filter.log
+grep -Eq '^  crayon ' /tmp/r-list-filter.log
+if grep -Eq '^  BiocManager ' /tmp/r-list-filter.log; then
+  echo "filter did not narrow the list" >&2
+  exit 1
+fi
+grep -q '共 1 个包' /tmp/r-list-filter.log
+
 step "invalid GitHub spec is rejected"
 printf '17\n8\n3\na/../b\n0\n0\n' | bionova > /tmp/r-badspec.log 2>&1
 grep -q '包名格式不合法' /tmp/r-badspec.log

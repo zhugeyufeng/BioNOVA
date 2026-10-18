@@ -1403,6 +1403,45 @@ RSCRIPT
   warn_if_rstudio_r_unconfigured
 }
 
+# 列出共享库中的包：版本、来源（CRAN / Bioconductor / GitHub 作者/仓库@提交）、编译时的 R 版本。只读查询。
+list_r_shared_packages() {
+  local r_home lib filter
+  select_r_home
+  r_home="$SELECTED_R_HOME"
+  lib="$(r_shared_lib_for_home "$r_home")" || { warn "该 R 尚未配置共享包目录（R 菜单 7）。"; return 1; }
+  [[ -d "$lib" ]] || { warn "共享目录不存在: $lib"; return 1; }
+  read -r -p "按包名过滤（不区分大小写，留空列出全部）: " filter
+
+  local code='args <- commandArgs(TRUE); lib <- args[1]; filter <- if (length(args) > 1) args[2] else ""
+ip <- installed.packages(lib.loc = lib, noCache = TRUE,
+  fields = c("Repository", "biocViews", "RemoteType", "RemoteUsername", "RemoteRepo", "RemoteSubdir", "RemoteSha", "RemoteRef"))
+if (nzchar(filter)) ip <- ip[grepl(filter, ip[, "Package"], ignore.case = TRUE, fixed = TRUE), , drop = FALSE]
+if (!nrow(ip)) { cat("  （没有匹配的包）\n"); quit(status = 0) }
+val <- function(i, f) { x <- ip[i, f]; if (is.na(x)) "" else x }
+source_of <- function(i) {
+  if (identical(val(i, "RemoteType"), "github")) {
+    repo <- paste0(val(i, "RemoteUsername"), "/", val(i, "RemoteRepo"))
+    if (nzchar(val(i, "RemoteSubdir"))) repo <- paste0(repo, "/", val(i, "RemoteSubdir"))
+    return(paste0("GitHub ", repo, "@", substr(val(i, "RemoteSha"), 1, 7)))
+  }
+  if (identical(val(i, "Repository"), "CRAN")) return("CRAN")
+  if (nzchar(val(i, "biocViews"))) return("Bioconductor")
+  if (nzchar(val(i, "Repository"))) return(val(i, "Repository"))
+  "其他"
+}
+ord <- order(tolower(ip[, "Package"]))
+cat(sprintf("  %-28s %-14s %-8s %s\n", "包", "版本", "编译R", "来源"))
+for (i in ord) cat(sprintf("  %-28s %-14s %-8s %s\n", ip[i, "Package"], ip[i, "Version"],
+  sub("^R ([0-9.]+).*$", "\\1", ip[i, "Built"]), source_of(i)))
+src <- vapply(seq_len(nrow(ip)), source_of, "")
+src[startsWith(src, "GitHub")] <- "GitHub"
+tab <- table(src)
+cat(sprintf("\n  共 %d 个包：%s\n", nrow(ip), paste(names(tab), tab, sep = " ", collapse = "，")))'
+
+  info "共享库: $lib（$(r_home_label "$r_home")）"
+  "$r_home/bin/Rscript" --vanilla -e "$code" "$lib" "$filter"
+}
+
 show_r_shared_status() {
   local -a homes=()
   local h lib count perm user pkgs_text default_home
@@ -1520,6 +1559,7 @@ install_r() {
     printf '7) 配置全体用户共享 R 包目录（Renviron.site）\n'
     printf '8) 管理员安装共享 R 包（clusterProfiler 等，所有用户可用）\n'
     printf '9) 查看共享 R 包目录 / 验证普通用户可见性\n'
+    printf '10) 列出已安装的共享 R 包（版本 / 来源）\n'
     printf '0) 返回主菜单\n'
     read -r -p "选择: " choice || return 0
 
@@ -1533,6 +1573,7 @@ install_r() {
       7) run_action "R: configure shared library" configure_r_shared_library ;;
       8) run_action "R: install shared packages" install_r_shared_packages ;;
       9) run_action "R: shared library status" show_r_shared_status ;;
+      10) run_action "R: list shared packages" list_r_shared_packages ;;
       0)
         CURRENT_ACTION="main menu"
         return 0

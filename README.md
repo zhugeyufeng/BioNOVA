@@ -93,6 +93,7 @@ sudo usermod -g bioadmin <用户>
 | 7 配置共享 R 包目录 | 为选定的（或全部）R 安装创建 `<根目录>/<R 主.次版本>`（默认 `/data_disk/R_Lib/4.6`，root 所有、0755，普通用户只读），并写入该 R 的 `R_HOME/etc/Renviron.site` |
 | 8 管理员安装共享 R 包 | 预设组合（GO/KEGG 富集：clusterProfiler、enrichplot、DOSE、AnnotationDbi、org.Hs/Mm/Dr.eg.db；常用分析包）或自定义包名 / GitHub 仓库，用 `BiocManager::install(lib = 共享目录, ask = FALSE, update = FALSE)` 安装，装完以指定普通用户身份逐个加载验证 |
 | 9 查看 / 验证 | 列出每个 R 的共享目录、权限、包数量，可选以普通用户身份验证可见性 |
+| 10 列出共享 R 包 | 按包名排序列出共享库中的包：版本、编译时的 R 版本、来源（CRAN / Bioconductor / `GitHub 作者/仓库@提交`），末尾按来源汇总；可按关键词过滤（不区分大小写） |
 
 `Renviron.site` 中写入的是一个由本程序管理的区块，重复配置只会替换这个区块，不会动文件里的其他内容：
 
