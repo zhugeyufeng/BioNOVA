@@ -1415,7 +1415,8 @@ list_r_shared_packages() {
   local code='args <- commandArgs(TRUE); lib <- args[1]; filter <- if (length(args) > 1) args[2] else ""
 ip <- installed.packages(lib.loc = lib, noCache = TRUE,
   fields = c("Repository", "biocViews", "RemoteType", "RemoteUsername", "RemoteRepo", "RemoteSubdir", "RemoteSha", "RemoteRef"))
-if (nzchar(filter)) ip <- ip[grepl(filter, ip[, "Package"], ignore.case = TRUE, fixed = TRUE), , drop = FALSE]
+# fixed = TRUE 时 grepl 会忽略 ignore.case，因此两边都转小写后按字面匹配。
+if (nzchar(filter)) ip <- ip[grepl(tolower(filter), tolower(ip[, "Package"]), fixed = TRUE), , drop = FALSE]
 if (!nrow(ip)) { cat("  （没有匹配的包）\n"); quit(status = 0) }
 val <- function(i, f) { x <- ip[i, f]; if (is.na(x)) "" else x }
 source_of <- function(i) {
