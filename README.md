@@ -91,7 +91,7 @@ sudo usermod -g bioadmin <用户>
 | R 菜单 | 作用 |
 | --- | --- |
 | 7 配置共享 R 包目录 | 为选定的（或全部）R 安装创建 `<根目录>/<R 主.次版本>`（默认 `/data_disk/R_Lib/4.6`，root 所有、0755，普通用户只读），并写入该 R 的 `R_HOME/etc/Renviron.site` |
-| 8 管理员安装共享 R 包 | 预设组合（GO/KEGG 富集：clusterProfiler、enrichplot、DOSE、AnnotationDbi、org.Hs/Mm/Dr.eg.db；常用分析包）或自定义包名，用 `BiocManager::install(lib = 共享目录, ask = FALSE, update = FALSE)` 安装，装完以指定普通用户身份逐个加载验证 |
+| 8 管理员安装共享 R 包 | 预设组合（GO/KEGG 富集：clusterProfiler、enrichplot、DOSE、AnnotationDbi、org.Hs/Mm/Dr.eg.db；常用分析包）或自定义包名 / GitHub 仓库，用 `BiocManager::install(lib = 共享目录, ask = FALSE, update = FALSE)` 安装，装完以指定普通用户身份逐个加载验证 |
 | 9 查看 / 验证 | 列出每个 R 的共享目录、权限、包数量，可选以普通用户身份验证可见性 |
 
 `Renviron.site` 中写入的是一个由本程序管理的区块，重复配置只会替换这个区块，不会动文件里的其他内容：
@@ -107,6 +107,8 @@ R_LIBS_SITE=/data_disk/R_Lib/4.6:${R_LIBS_SITE-/opt/R/4.6.1/lib/R/site-library}
 - 每个 R 主.次版本有独立目录。用 rig 安装新版本 R 后，菜单会提示为新版本配置；旧版本编译的包不会被新 R 加载。
 - 安装时 R 使用当前该 R 的 `repos` 配置（rig 默认的 Posit 二进制源会保留），也可以临时指定 CRAN 镜像和 Bioconductor 镜像（例如 `https://mirrors.tuna.tsinghua.edu.cn/bioconductor`）。Bioconductor 版本由 BiocManager 按 R 版本自动匹配。
 - 安装进程屏蔽 root 的个人库，并使用 `umask 022`：避免 root 个人库里已有同名包导致 BiocManager 跳过安装、普通用户却看不到；安装出的文件对所有用户可读。
+- 自定义安装支持 GitHub 包，写法为 `作者/仓库`、`作者/仓库/子目录` 或带版本的 `作者/仓库@tag|分支|提交`，可与普通包名混写，例如 `msigdbr YuLab-SMU/clusterProfiler@devel`。用 `remotes::install_github(lib = 共享目录, upgrade = "never")` 安装，依赖从 CRAN 和与当前 R 匹配的 Bioconductor 仓库解析；验证时使用 DESCRIPTION 中实际的包名。GitHub 上默认是开发版，Bioconductor 已收录的包建议直接写包名安装正式版。
+- 安装 GitHub 包时可选填 GitHub token，避免匿名 API 每小时 60 次的限流。token 只写入 0600 临时文件供本次安装读取，装完即删除，不会出现在命令行、进程列表或日志中。
 - 包名写错（例如把 `org.Hs.eg.db` 写成 `org.Hm.eg.db`）时，BiocManager 只给出警告；程序会在安装后逐个检查，把缺失的包列出来并判定为失败。
 - RStudio Server 读取的是 `rsession-which-r` 指向的那个 R 的 `Renviron.site`；如果它没有配置共享库，菜单会给出提示。已打开的 RStudio 会话需要 Session → Restart R 才会生效。
 

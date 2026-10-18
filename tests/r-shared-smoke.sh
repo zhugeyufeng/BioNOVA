@@ -2,6 +2,7 @@
 # 共享 R 包库端到端测试：配置 Renviron.site、管理员安装包、普通用户可见性。
 # 会真实修改系统（安装 R、写 Renviron.site、创建用户），只允许在一次性容器或 CI 中运行。
 # 用法: tests/r-shared-smoke.sh <dist/bionova 或 assets/bioinfo-server-init.sh>
+# 可选环境变量: TEST_CRAN_MIRROR（CRAN 镜像）、TEST_GITHUB_PAT（GitHub token）
 set -Eeuo pipefail
 
 TARGET="${1:?usage: tests/r-shared-smoke.sh <bionova binary or script>}"
@@ -46,7 +47,7 @@ if grep -q 'bioinfo-setup shared R library' "$renviron" 2>/dev/null; then
 fi
 
 echo "== R menu 8: configure on demand, install BiocManager, verify as tester"
-printf '17\n8\ny\n%s\n3\nBiocManager\n\n\nn\ny\ntester\n0\n0\n' "$root" | bionova 2>&1 | tee /tmp/r-install.log
+printf '17\n8\ny\n%s\n3\nBiocManager\n%s\n\nn\ny\ntester\n0\n0\n' "$root" "${TEST_CRAN_MIRROR:-}" | bionova 2>&1 | tee /tmp/r-install.log
 expect_no_failed_action /tmp/r-install.log
 
 echo "== Renviron.site block"
@@ -73,6 +74,23 @@ printf '17\n7\n%s\na\n0\n0\n' "$root" | bionova > /tmp/r-reconf.log 2>&1
 expect_no_failed_action /tmp/r-reconf.log
 test "$(grep -c 'bioinfo-setup shared R library >>>' "$renviron")" -eq 1
 test "$(user_paths)" = "$after"
+
+echo "== GitHub package (r-lib/crayon) into the shared library"
+# 流程：自定义 → 作者/仓库 → token（CI 传入，可为空）→ 镜像留空 → 不装系统依赖 → 确认 → tester 验证
+printf '17\n8\n3\nr-lib/crayon\n%s\n%s\n\nn\ny\ntester\n0\n0\n' "${TEST_GITHUB_PAT:-}" "${TEST_CRAN_MIRROR:-}" | bionova 2>&1 | tee /tmp/r-github.log
+expect_no_failed_action /tmp/r-github.log
+test -f "$lib/remotes/DESCRIPTION"
+test -f "$lib/crayon/DESCRIPTION"
+grep -q 'RemoteType: github' "$lib/crayon/DESCRIPTION"
+grep -Eq "crayon +OK +$lib" /tmp/r-github.log
+if [[ -n "${TEST_GITHUB_PAT:-}" ]] && grep -rqF "$TEST_GITHUB_PAT" /tmp/r-github.log /var/log/bioinfo-setup; then
+  echo "GitHub token leaked into output or logs" >&2
+  exit 1
+fi
+
+echo "== invalid GitHub spec is rejected"
+printf '17\n8\n3\na/../b\n0\n0\n' | bionova > /tmp/r-badspec.log 2>&1
+grep -q '包名格式不合法' /tmp/r-badspec.log
 
 echo "== status shows the library and verifies as tester"
 printf '17\n9\ntester\nBiocManager\n0\n0\n' | bionova 2>&1 | tee /tmp/r-status.log

@@ -61,6 +61,8 @@ R_BUILD_DEPS=(
   libharfbuzz-dev libfribidi-dev libglpk-dev libhdf5-dev libgsl-dev
   zlib1g-dev libbz2-dev liblzma-dev
 )
+# GitHub 包写法：作者/仓库[/子目录...][@tag|分支|提交]；每段以字母或数字开头（排除 .. 等路径）。
+R_GITHUB_SPEC_RE='^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*(@[A-Za-z0-9][A-Za-z0-9._/-]*)?$'
 SELECTED_R_HOME=""
 R_SHARED_LIB_LAST=""
 LOG_DIR="/var/log/bioinfo-setup"
@@ -1220,8 +1222,8 @@ default_r_verify_user() {
 }
 
 install_r_shared_packages() {
-  local r_home ver lib root choice cran bioc verify_user pkg script
-  local -a pkgs=()
+  local r_home ver lib root choice cran bioc verify_user pkg script github_pat="" pat_file="" result_file
+  local -a pkgs=() github_pkgs=() installed_pkgs=()
 
   select_r_home
   r_home="$SELECTED_R_HOME"
@@ -1238,18 +1240,40 @@ install_r_shared_packages() {
   printf '\n共享 R 包组合：\n'
   printf '1) GO/KEGG 富集分析：%s\n' "${R_SHARED_PKGS_ENRICH[*]}"
   printf '2) 常用分析包：%s\n' "${R_SHARED_PKGS_COMMON[*]}"
-  printf '3) 自定义包名（CRAN / Bioconductor，空格分隔）\n'
+  printf '3) 自定义：CRAN / Bioconductor 包名，或 GitHub 作者/仓库[/子目录][@版本]，空格分隔\n'
   read -r -p "选择 [1]: " choice
   case "${choice:-1}" in
     1) pkgs=("${R_SHARED_PKGS_ENRICH[@]}") ;;
     2) pkgs=("${R_SHARED_PKGS_COMMON[@]}") ;;
-    3) read -r -a pkgs -p "包名: " ;;
+    3)
+      printf '  例如: msigdbr  YuLab-SMU/clusterProfiler  satijalab/seurat-wrappers@master\n'
+      read -r -a pkgs -p "包名: "
+      ;;
     *) warn "无效选择: $choice"; return 1 ;;
   esac
   (( ${#pkgs[@]} > 0 )) || { warn "没有输入包名。"; return 1; }
   for pkg in "${pkgs[@]}"; do
-    [[ "$pkg" =~ ^[A-Za-z][A-Za-z0-9.]*[A-Za-z0-9]$ ]] || { warn "包名格式不合法: $pkg"; return 1; }
+    if [[ "$pkg" =~ $R_GITHUB_SPEC_RE ]]; then
+      github_pkgs+=("$pkg")
+    elif [[ ! "$pkg" =~ ^[A-Za-z][A-Za-z0-9.]*[A-Za-z0-9]$ ]]; then
+      warn "包名格式不合法: $pkg（GitHub 包请写成 作者/仓库，例如 YuLab-SMU/clusterProfiler）"
+      return 1
+    fi
   done
+
+  if (( ${#github_pkgs[@]} > 0 )); then
+    warn "GitHub 包默认安装仓库最新的开发版，可能与当前 Bioconductor 版本不兼容；Bioconductor 已收录的包建议直接写包名。"
+    # token 只写入 0600 临时文件供本次安装读取，不出现在命令行、进程列表或日志中。
+    read -r -s -p "GitHub token（可选，避免匿名 API 每小时 60 次的限流；留空跳过）: " github_pat
+    printf '\n'
+    if [[ -n "$github_pat" ]]; then
+      [[ "$github_pat" =~ ^[A-Za-z0-9_]+$ ]] || { warn "GitHub token 格式不正确。"; return 1; }
+      pat_file="$(mktemp "$WORK_TMP/github-pat.XXXXXX")"
+      chmod 0600 "$pat_file"
+      printf '%s\n' "$github_pat" > "$pat_file"
+      github_pat=""
+    fi
+  fi
 
   read -r -p "CRAN 镜像（留空保持该 R 当前的 repos 配置）: " cran
   read -r -p "Bioconductor 镜像（留空使用官方，例如 https://mirrors.tuna.tsinghua.edu.cn/bioconductor）: " bioc
@@ -1268,14 +1292,24 @@ install_r_shared_packages() {
   printf '  包:      %s\n' "${pkgs[*]}"
   printf '  CRAN:    %s\n' "${cran:-保持当前配置}"
   printf '  Bioc:    %s\n' "${bioc:-官方}"
+  if (( ${#github_pkgs[@]} > 0 )); then
+    printf '  GitHub:  %s（token: %s）\n' "${github_pkgs[*]}" "$([[ -n "$pat_file" ]] && printf 已提供 || printf 未提供)"
+  fi
   confirm "确认以管理员身份安装到共享库？" || { warn "已取消。"; return 0; }
 
   script="$WORK_TMP/install-shared-r-packages.R"
+  result_file="$WORK_TMP/installed-shared-r-packages.txt"
   cat > "$script" <<'RSCRIPT'
 args <- commandArgs(trailingOnly = TRUE)
 lib <- args[[1]]
-pkgs <- unique(args[-1])
+result_file <- args[[2]]
+specs <- unique(args[-(1:2)])
 .libPaths(c(lib, .libPaths()))
+is_github <- grepl("/", specs, fixed = TRUE)
+pkgs <- specs[!is_github]
+github <- specs[is_github]
+pat_file <- Sys.getenv("BIOINFO_GITHUB_PAT_FILE")
+if (nzchar(pat_file) && file.exists(pat_file)) Sys.setenv(GITHUB_PAT = readLines(pat_file, n = 1L, warn = FALSE))
 
 repos <- getOption("repos")
 if (is.null(repos)) repos <- c(CRAN = "@CRAN@")
@@ -1287,33 +1321,80 @@ bioc <- Sys.getenv("BIOINFO_BIOC_MIRROR")
 if (nzchar(bioc)) options(BioC_mirror = bioc)
 options(Ncpus = max(1L, parallel::detectCores() - 1L))
 
-if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", lib = lib)
+need_cran_pkg <- function(p) {
+  if (requireNamespace(p, quietly = TRUE)) return(invisible())
+  install.packages(p, lib = lib)
+  if (!requireNamespace(p, quietly = TRUE)) {
+    message("无法从 CRAN 安装 ", p, "（当前 CRAN: ", getOption("repos")[["CRAN"]], "）。")
+    message("请检查服务器网络，或在安装时指定国内 CRAN 镜像，例如 https://mirrors.tuna.tsinghua.edu.cn/CRAN/")
+    quit(status = 1)
+  }
+}
+need_cran_pkg("BiocManager")
 # update = FALSE：不顺带升级 Matrix、MASS 等已有包，避免影响其他用户的分析结果。
-BiocManager::install(pkgs, lib = lib, ask = FALSE, update = FALSE)
+if (length(pkgs)) BiocManager::install(pkgs, lib = lib, ask = FALSE, update = FALSE)
+
+# GitHub 包：依赖从 CRAN + 与当前 R 匹配的 Bioconductor 仓库解析；upgrade = "never" 同样不升级已有包。
+github_names <- character()
+failed_github <- character()
+if (length(github)) {
+  need_cran_pkg("remotes")
+  for (spec in github) {
+    name <- tryCatch(
+      remotes::install_github(spec, lib = lib, repos = BiocManager::repositories(),
+                              upgrade = "never", dependencies = NA, build_vignettes = FALSE),
+      error = function(e) { message("GitHub 安装失败 ", spec, ": ", conditionMessage(e)); NA_character_ })
+    name <- as.character(name)[1]
+    if (is.na(name) || !nzchar(name) || identical(name, "FALSE")) {
+      # 未返回包名（例如已是最新提交而跳过）时，按仓库路径推断：作者/仓库/子目录 → 最后一段
+      name <- basename(sub("@.*$", "", spec))
+    }
+    if (nzchar(system.file(package = name))) github_names <- c(github_names, name) else failed_github <- c(failed_github, spec)
+  }
+}
 
 missing <- pkgs[!vapply(pkgs, function(p) nzchar(system.file(package = p)), logical(1))]
-if (length(missing)) {
-  message("以下包未能安装: ", paste(missing, collapse = ", "))
-  message("请检查包名拼写（例如人类注释包是 org.Hs.eg.db，不是 org.Hm.eg.db），以及上方日志中最早出现的 ERROR。")
+if (length(missing) || length(failed_github)) {
+  if (length(missing)) {
+    message("以下包未能安装: ", paste(missing, collapse = ", "))
+    message("请检查包名拼写（例如人类注释包是 org.Hs.eg.db，不是 org.Hm.eg.db），以及上方日志中最早出现的 ERROR。")
+  }
+  if (length(failed_github)) {
+    message("以下 GitHub 包未能安装: ", paste(failed_github, collapse = ", "))
+    message("请检查 作者/仓库 是否正确、仓库根目录（或子目录）是否包含 DESCRIPTION，以及是否触发了 GitHub API 限流。")
+  }
   quit(status = 1)
 }
+writeLines(c(pkgs, github_names), result_file)
 message("共享库: ", lib)
 message("Bioconductor ", as.character(BiocManager::version()), " / ", R.version.string)
 RSCRIPT
 
   # R_LIBS_USER 指向不存在的目录：root 个人库中已有的包不会让 BiocManager 跳过安装
   # （否则普通用户看不到）；umask 022 保证安装出的文件对所有用户可读。
-  as_root env R_LIBS_USER=/nonexistent/bioinfo-setup R_LIBS= \
-    BIOINFO_CRAN_MIRROR="$cran" BIOINFO_BIOC_MIRROR="$bioc" \
-    bash -c 'umask 022; exec "$@"' _ "$r_home/bin/Rscript" "$script" "$lib" "${pkgs[@]}"
+  if ! as_root env R_LIBS_USER=/nonexistent/bioinfo-setup R_LIBS= \
+    BIOINFO_CRAN_MIRROR="$cran" BIOINFO_BIOC_MIRROR="$bioc" BIOINFO_GITHUB_PAT_FILE="$pat_file" \
+    bash -c 'umask 022; exec "$@"' _ "$r_home/bin/Rscript" "$script" "$lib" "$result_file" "${pkgs[@]}"; then
+    [[ -z "$pat_file" ]] || rm -f -- "$pat_file"
+    warn "共享 R 包安装失败，请查看上方日志。"
+    return 1
+  fi
+  [[ -z "$pat_file" ]] || rm -f -- "$pat_file"
   log "共享 R 包已安装到 $lib"
+
+  # 验证时使用实际的包名（GitHub 仓库名可能与包名不同）。
+  if (( DRY_RUN )); then
+    installed_pkgs=("${pkgs[@]}")
+  else
+    mapfile -t installed_pkgs < "$result_file"
+  fi
 
   verify_user="$(default_r_verify_user || true)"
   read -r -p "用于验证的普通用户名（留空跳过）[${verify_user:-无}]: " choice
   verify_user="${choice:-$verify_user}"
   if [[ -n "$verify_user" ]]; then
     id "$verify_user" >/dev/null 2>&1 || { warn "用户 $verify_user 不存在。"; return 1; }
-    if ! verify_r_packages_as_user "$verify_user" "$r_home" "${pkgs[@]}"; then
+    if ! verify_r_packages_as_user "$verify_user" "$r_home" "${installed_pkgs[@]}"; then
       warn "用户 $verify_user 无法加载部分共享包；请检查上面的 .libPaths() 是否包含 $lib。"
       return 1
     fi

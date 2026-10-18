@@ -156,6 +156,9 @@ jobs:
           path: dist
 
       - name: Shared R library end-to-end
+        env:
+          # 用于 GitHub 包安装测试，避免共享 runner IP 触发匿名 API 限流
+          TEST_GITHUB_PAT: ${{ github.token }}
         run: |
           chmod 0755 dist/bionova
           bash tests/r-shared-smoke.sh dist/bionova
